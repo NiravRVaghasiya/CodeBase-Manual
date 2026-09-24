@@ -1,9 +1,17 @@
 """SQLAlchemy schema for persisted repository intelligence.
 
-Deliberately small: `repositories`, `index_runs`, `files`, `symbols`,
-`relationships`. Symbol- and relationship-specific detail is kept in a JSON
-payload rather than further normalized tables, per the plan's guidance to
-add tables only when justified.
+Deliberately small: `repositories`, `working_copies`, `index_runs`,
+`files`, `symbols`, `relationships`, `ai_cache`. Symbol- and relationship-
+specific detail is kept in a JSON payload rather than further normalized
+tables, per the plan's guidance to add tables only when justified.
+
+`RepositoryORM` identifies a *logical* repository (its Git remote, or its
+root path when there is none). `WorkingCopyORM` identifies one checkout of
+that repository on disk -- there can be more than one (different machines,
+different local paths) producing index runs for the same logical
+repository. Keeping them distinct lets `latest_snapshot` prefer the run
+from the working copy actually being queried, rather than whichever
+working copy happened to index most recently.
 """
 
 from __future__ import annotations
@@ -26,9 +34,27 @@ class RepositoryORM(Base):
     root: Mapped[str]
     created_at: Mapped[datetime]
 
+    working_copies: Mapped[list[WorkingCopyORM]] = relationship(
+        back_populates="repository", cascade="all, delete-orphan"
+    )
     index_runs: Mapped[list[IndexRunORM]] = relationship(
         back_populates="repository", cascade="all, delete-orphan"
     )
+
+
+class WorkingCopyORM(Base):
+    """One checkout, on disk, of a logical `RepositoryORM`."""
+
+    __tablename__ = "working_copies"
+    __table_args__ = (UniqueConstraint("repository_id", "root", name="uq_repo_root"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    repository_id: Mapped[int] = mapped_column(ForeignKey("repositories.id"))
+    root: Mapped[str]
+    created_at: Mapped[datetime]
+
+    repository: Mapped[RepositoryORM] = relationship(back_populates="working_copies")
+    index_runs: Mapped[list[IndexRunORM]] = relationship(back_populates="working_copy")
 
 
 class IndexRunORM(Base):
@@ -37,6 +63,7 @@ class IndexRunORM(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     repository_id: Mapped[int] = mapped_column(ForeignKey("repositories.id"))
+    working_copy_id: Mapped[int] = mapped_column(ForeignKey("working_copies.id"))
     commit_sha: Mapped[str | None]
     branch: Mapped[str | None]
     is_dirty: Mapped[bool | None]
@@ -44,6 +71,7 @@ class IndexRunORM(Base):
     indexed_at: Mapped[datetime]
 
     repository: Mapped[RepositoryORM] = relationship(back_populates="index_runs")
+    working_copy: Mapped[WorkingCopyORM] = relationship(back_populates="index_runs")
     files: Mapped[list[FileORM]] = relationship(
         back_populates="index_run", cascade="all, delete-orphan"
     )
@@ -66,6 +94,8 @@ class FileORM(Base):
     language: Mapped[str]
     is_binary: Mapped[bool]
     content_hash: Mapped[str | None]
+    hash_strategy: Mapped[str]
+    mtime: Mapped[float | None]
 
     index_run: Mapped[IndexRunORM] = relationship(back_populates="files")
 
@@ -100,3 +130,19 @@ class RelationshipORM(Base):
     location: Mapped[str | None]
 
     index_run: Mapped[IndexRunORM] = relationship(back_populates="relationships_")
+
+
+class AICacheORM(Base):
+    """A generic key-value cache, currently used for AI file summaries.
+
+    Kept generic (opaque `payload`) rather than typed to a specific AI
+    result, so the persistence layer doesn't need to depend on `ai.models`
+    -- see `ai.summary_cache` for the typed key/serialization scheme.
+    """
+
+    __tablename__ = "ai_cache"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    cache_key: Mapped[str] = mapped_column(unique=True, index=True)
+    payload: Mapped[str]
+    created_at: Mapped[datetime]

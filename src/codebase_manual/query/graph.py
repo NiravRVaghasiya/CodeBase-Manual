@@ -7,11 +7,25 @@ with evidence -- it never invents a dependency.
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 from codebase_manual.domain.models import EntityRef, Relationship, RelationshipKind
 
 # Kinds that represent "A depends on B" when followed forward from A.
 DEPENDENCY_KINDS = (RelationshipKind.IMPORTS, RelationshipKind.CALLS, RelationshipKind.INHERITS)
+
+
+@dataclass(frozen=True)
+class Traversal:
+    """The result of a bounded graph traversal.
+
+    `truncated` is true when the traversal hit `max_depth` while entities
+    remained unexplored -- the graph beyond that point is unknown, not
+    empty. Callers must not treat `entities` as complete when this is set.
+    """
+
+    entities: list[EntityRef] = field(default_factory=list)
+    truncated: bool = False
 
 
 class RelationshipGraph:
@@ -45,13 +59,19 @@ class RelationshipGraph:
         """What directly depends on `ref`: its incoming imports/calls/inherits edges."""
         return self.incoming(ref, DEPENDENCY_KINDS)
 
-    def transitive_dependents(self, ref: EntityRef, max_depth: int = 5) -> list[EntityRef]:
-        """All entities that depend on `ref`, directly or through a chain, in BFS order."""
+    def transitive_dependents_traversal(self, ref: EntityRef, max_depth: int = 5) -> Traversal:
+        """All entities that depend on `ref`, directly or through a chain, in BFS order.
+
+        Sets `Traversal.truncated` when entities remained to explore at
+        `max_depth` -- the true transitive set may be larger than what's
+        returned.
+        """
         visited: set[EntityRef] = {ref}
         frontier = [ref]
         collected: list[EntityRef] = []
+        truncated = False
 
-        for _ in range(max_depth):
+        for depth in range(max_depth):
             next_frontier: list[EntityRef] = []
             for node in frontier:
                 for edge in self.dependents_of(node):
@@ -63,8 +83,18 @@ class RelationshipGraph:
             if not next_frontier:
                 break
             frontier = next_frontier
+            if depth == max_depth - 1:
+                truncated = True
 
-        return collected
+        return Traversal(entities=collected, truncated=truncated)
+
+    def transitive_dependents(self, ref: EntityRef, max_depth: int = 5) -> list[EntityRef]:
+        """All entities that depend on `ref`, directly or through a chain, in BFS order.
+
+        Convenience wrapper over `transitive_dependents_traversal` for
+        callers that don't need to know whether the result was truncated.
+        """
+        return self.transitive_dependents_traversal(ref, max_depth).entities
 
     def tests_for(self, ref: EntityRef) -> list[Relationship]:
         """Test modules with a direct TESTS edge to `ref`."""

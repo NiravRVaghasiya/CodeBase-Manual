@@ -1,11 +1,20 @@
 """Core entities and relationships of the code intelligence model."""
 
+from codebase_manual.domain.evidence import (
+    Evidence,
+    EvidenceStrength,
+    EvidenceType,
+    evidence_from_relationship,
+    strength_for_relationship_kind,
+)
 from codebase_manual.domain.models import (
+    CallSite,
     ClassSymbol,
     Decorator,
     DirectoryRecord,
     EntityKind,
     EntityRef,
+    FileHashStrategy,
     FileLanguage,
     FileRecord,
     FunctionSymbol,
@@ -25,11 +34,18 @@ from codebase_manual.domain.relationships import build_relationships
 
 __all__ = [
     "build_relationships",
+    "CallSite",
     "ClassSymbol",
     "Decorator",
     "DirectoryRecord",
     "EntityKind",
     "EntityRef",
+    "Evidence",
+    "EvidenceType",
+    "EvidenceStrength",
+    "evidence_from_relationship",
+    "strength_for_relationship_kind",
+    "FileHashStrategy",
     "FileLanguage",
     "FileRecord",
     "FunctionSymbol",

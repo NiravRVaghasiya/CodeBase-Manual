@@ -3,13 +3,27 @@ repository's deterministic facts, optionally enriched with AI summaries.
 
 Facts-only sections are always populated, with or without a provider. A
 missing or failing AI summary is reported honestly inline, never silently
-dropped or replaced with a guess.
+dropped or replaced with a guess. When a `cache` is supplied, a module
+whose file content hash hasn't changed reuses its previously generated
+summary instead of requesting a new one on every invocation -- see
+`ai.summary_cache`.
 """
 
 from __future__ import annotations
 
-from codebase_manual.ai.provider import AIProvider, AIProviderNotConfiguredError, AISynthesisError
+from codebase_manual.ai.provider import (
+    AIProvider,
+    AIProviderError,
+    AIProviderNotConfiguredError,
+    AISynthesisError,
+)
 from codebase_manual.ai.summarizer import summarize_file
+from codebase_manual.ai.summary_cache import (
+    SummaryCacheStore,
+    cache_summary,
+    get_cached_summary,
+    summary_cache_key,
+)
 from codebase_manual.domain.models import FileLanguage, PythonModule
 from codebase_manual.persistence.snapshot import RepositorySnapshot
 from codebase_manual.query.api_endpoints import detect_api_endpoints
@@ -36,17 +50,42 @@ def _overview_section(snapshot: RepositorySnapshot) -> str:
     return "\n".join(lines)
 
 
-def _module_summary_line(module: PythonModule, provider: AIProvider | None) -> str:
+def _module_summary_line(
+    module: PythonModule,
+    provider: AIProvider | None,
+    content_hash: str | None,
+    cache: SummaryCacheStore | None,
+) -> str:
     if provider is None:
         return "AI summary unavailable: no provider configured."
+
+    cache_key = None
+    if cache is not None:
+        cache_key = summary_cache_key(
+            content_hash=content_hash, model_identifier=provider.model_identifier
+        )
+        if cache_key is not None:
+            cached = get_cached_summary(cache, cache_key)
+            if cached is not None:
+                return (
+                    f"AI summary ({cached.confidence.value} confidence, cached): "
+                    f"{cached.purpose}"
+                )
+
     try:
         summary = summarize_file(module, provider)
-        return f"AI summary ({summary.confidence.value} confidence): {summary.purpose}"
-    except (AIProviderNotConfiguredError, AISynthesisError) as exc:
+    except (AIProviderNotConfiguredError, AIProviderError, AISynthesisError) as exc:
         return f"AI summary unavailable: {exc}"
 
+    if cache is not None and cache_key is not None:
+        cache_summary(cache, cache_key, summary)
+    return f"AI summary ({summary.confidence.value} confidence): {summary.purpose}"
 
-def _modules_section(snapshot: RepositorySnapshot, provider: AIProvider | None) -> str:
+
+def _modules_section(
+    snapshot: RepositorySnapshot, provider: AIProvider | None, cache: SummaryCacheStore | None
+) -> str:
+    content_hash_by_path = {f.path: f.content_hash for f in snapshot.files}
     lines = ["", "## Modules", ""]
     for module in sorted(snapshot.modules, key=lambda m: m.path):
         lines.append(f"### `{module.path}`")
@@ -54,7 +93,9 @@ def _modules_section(snapshot: RepositorySnapshot, provider: AIProvider | None) 
             lines.append(f"Module: `{module.module_name}`")
         if module.docstring:
             lines.append(f"> {module.docstring}")
-        lines.append(_module_summary_line(module, provider))
+        lines.append(
+            _module_summary_line(module, provider, content_hash_by_path.get(module.path), cache)
+        )
         if module.classes:
             lines.append("Classes:")
             for klass in module.classes:
@@ -117,10 +158,14 @@ def _database_section(snapshot: RepositorySnapshot) -> str:
     return "\n".join(lines)
 
 
-def generate_manual(snapshot: RepositorySnapshot, provider: AIProvider | None = None) -> str:
+def generate_manual(
+    snapshot: RepositorySnapshot,
+    provider: AIProvider | None = None,
+    cache: SummaryCacheStore | None = None,
+) -> str:
     sections = [
         _overview_section(snapshot),
-        _modules_section(snapshot, provider),
+        _modules_section(snapshot, provider, cache),
         _configuration_section(snapshot),
         _apis_section(snapshot),
         _database_section(snapshot),

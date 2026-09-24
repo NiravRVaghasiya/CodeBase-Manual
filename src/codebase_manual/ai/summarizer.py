@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from pydantic import ValidationError
 
-from codebase_manual.ai.models import Confidence, EvidenceItem, FileSummary, FunctionSummary
+from codebase_manual.ai.confidence import confidence_for_summary
+from codebase_manual.ai.models import EvidenceItem, FileSummary, FunctionSummary
 from codebase_manual.ai.provider import AIProvider, AISynthesisError, complete_json
 from codebase_manual.domain.models import FunctionSymbol, PythonModule
 
@@ -18,20 +19,17 @@ _SYSTEM_PROMPT = (
     "You are a precise code-analysis assistant. You are given deterministic "
     "facts about Python source code -- never assume anything beyond them. "
     "Respond with a single JSON object only, no prose, no markdown fences, "
-    "matching exactly the fields requested. If you are not confident, say "
-    "so via the `confidence` field ('high', 'medium', or 'low') rather than "
-    "guessing."
+    "matching exactly the fields requested."
 )
 
 _FILE_SCHEMA = (
     '{"purpose": "one sentence", "responsibilities": ["..."], '
-    '"important_symbols": ["..."], "side_effects": ["..."], '
-    '"confidence": "high|medium|low"}'
+    '"important_symbols": ["..."], "side_effects": ["..."]}'
 )
 
 _FUNCTION_SCHEMA = (
     '{"purpose": "one sentence", "inputs": ["..."], "outputs": ["..."], '
-    '"side_effects": ["..."], "confidence": "high|medium|low"}'
+    '"side_effects": ["..."]}'
 )
 
 
@@ -71,13 +69,17 @@ def _function_facts(function: FunctionSymbol, module_path: str) -> str:
     if function.docstring:
         lines.append(f"Docstring: {function.docstring}")
     if function.calls:
-        lines.append(f"Calls: {', '.join(function.calls)}")
+        lines.append(f"Calls: {', '.join(c.expression for c in function.calls)}")
     return "\n".join(lines)
 
 
 def summarize_file(module: PythonModule, provider: AIProvider) -> FileSummary:
     prompt = f"{_module_facts(module)}\n\nRespond with JSON matching: {_FILE_SCHEMA}"
     payload = complete_json(provider, system=_SYSTEM_PROMPT, prompt=prompt)
+    confidence = confidence_for_summary(
+        has_docstring=bool(module.docstring),
+        has_structural_facts=bool(module.classes or module.functions or module.imports),
+    )
 
     try:
         return FileSummary(
@@ -86,7 +88,7 @@ def summarize_file(module: PythonModule, provider: AIProvider) -> FileSummary:
             responsibilities=list(payload.get("responsibilities", [])),
             important_symbols=list(payload.get("important_symbols", [])),
             side_effects=list(payload.get("side_effects", [])),
-            confidence=Confidence(payload["confidence"]),
+            confidence=confidence,
             evidence=[
                 EvidenceItem(
                     description=f"facts extracted from {module.path}", file_path=module.path
@@ -105,6 +107,10 @@ def summarize_function(
     facts = _function_facts(function, module_path)
     prompt = f"{facts}\n\nRespond with JSON matching: {_FUNCTION_SCHEMA}"
     payload = complete_json(provider, system=_SYSTEM_PROMPT, prompt=prompt)
+    confidence = confidence_for_summary(
+        has_docstring=bool(function.docstring),
+        has_structural_facts=bool(function.parameters or function.calls),
+    )
 
     try:
         return FunctionSummary(
@@ -113,7 +119,7 @@ def summarize_function(
             inputs=list(payload.get("inputs", [])),
             outputs=list(payload.get("outputs", [])),
             side_effects=list(payload.get("side_effects", [])),
-            confidence=Confidence(payload["confidence"]),
+            confidence=confidence,
             evidence=[
                 EvidenceItem(
                     description=f"facts extracted from {function.qualified_name}",

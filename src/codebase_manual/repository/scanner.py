@@ -13,8 +13,10 @@ from pathlib import Path
 import pathspec
 from pathspec.pattern import Pattern
 
+from codebase_manual.analyzer.config import SecurityConfig, load_security_config
 from codebase_manual.domain.models import (
     DirectoryRecord,
+    FileHashStrategy,
     FileLanguage,
     FileRecord,
     GitMetadata,
@@ -34,10 +36,6 @@ _LANGUAGE_BY_EXTENSION: dict[str, FileLanguage] = {
 
 _ALWAYS_IGNORED_DIRS = {".git", ".codebase_manual"}
 
-# Files larger than this are not hashed; content drift detection isn't worth
-# the I/O cost for large assets, and they're rarely source files anyway.
-_MAX_HASHABLE_BYTES = 5 * 1024 * 1024
-
 
 def _detect_language(path: Path) -> FileLanguage:
     if path.name.startswith(".env"):
@@ -54,20 +52,37 @@ def _is_binary(path: Path, sample_size: int = 8192) -> bool:
     return b"\x00" in chunk
 
 
-def _content_hash(path: Path, size_bytes: int) -> str | None:
-    if size_bytes > _MAX_HASHABLE_BYTES:
-        return None
+def _fingerprint(
+    path: Path,
+    size_bytes: int,
+    *,
+    is_binary: bool,
+    language: FileLanguage,
+    max_hashable_bytes: int,
+) -> tuple[str | None, FileHashStrategy]:
+    """A file's content hash when affordable and safe, else `None` with `METADATA_ONLY`.
+
+    `METADATA_ONLY` is not "unknown" -- drift detection compares
+    `size_bytes`/`mtime` for these files instead of treating them as
+    unconditionally changed (see `query.drift`). `.env*` files are always
+    `METADATA_ONLY`: their bytes are never read into process memory at all,
+    so their content can never reach a hash, the database, or an AI prompt
+    (see `analyzer.config.DEFAULT_IGNORED_PATTERNS` for the rest of the
+    secret-shaped-file policy).
+    """
+    if is_binary or size_bytes > max_hashable_bytes or language is FileLanguage.ENV:
+        return None, FileHashStrategy.METADATA_ONLY
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        return hashlib.sha256(path.read_bytes()).hexdigest(), FileHashStrategy.FULL_HASH
     except OSError:
-        return None
+        return None, FileHashStrategy.METADATA_ONLY
 
 
-def _load_ignore_spec(root: Path) -> pathspec.PathSpec[Pattern]:
-    patterns: list[str] = []
+def _load_ignore_spec(root: Path, extra_patterns: tuple[str, ...]) -> pathspec.PathSpec[Pattern]:
+    patterns: list[str] = list(extra_patterns)
     gitignore_path = root / ".gitignore"
     if gitignore_path.is_file():
-        patterns = gitignore_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        patterns.extend(gitignore_path.read_text(encoding="utf-8", errors="ignore").splitlines())
     return pathspec.PathSpec.from_lines("gitignore", patterns)
 
 
@@ -119,8 +134,9 @@ def repository_identity(root: Path, git: GitMetadata) -> str:
 class RepositoryScanner:
     """Discovers repository structure: directories, files, languages, and Git metadata."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, security_config: SecurityConfig | None = None) -> None:
         self._root = Path(root).resolve()
+        self._security_config = security_config or load_security_config(self._root)
 
     @property
     def root(self) -> Path:
@@ -128,7 +144,9 @@ class RepositoryScanner:
 
     def scan(self) -> ScanResult:
         root = self._root
-        ignore_spec = _load_ignore_spec(root)
+        config = self._security_config
+        ignore_spec = _load_ignore_spec(root, config.ignore_patterns)
+        ignored_extensions = config.normalized_ignored_extensions
 
         directories: list[DirectoryRecord] = []
         files: list[FileRecord] = []
@@ -151,25 +169,38 @@ class RepositoryScanner:
 
             for filename in sorted(filenames):
                 rel_path = filename if at_root else (rel_dir / filename).as_posix()
-                if ignore_spec.match_file(rel_path):
+                abs_path = current_path / filename
+                is_ignored = ignore_spec.match_file(rel_path) or (
+                    abs_path.suffix.lower() in ignored_extensions
+                )
+                if is_ignored:
                     ignored_file_paths.append(rel_path)
                     continue
 
-                abs_path = current_path / filename
                 try:
-                    size_bytes = abs_path.stat().st_size
+                    stat_result = abs_path.stat()
                 except OSError:
                     continue
 
                 is_binary = _is_binary(abs_path)
+                language = _detect_language(abs_path)
+                content_hash, hash_strategy = _fingerprint(
+                    abs_path,
+                    stat_result.st_size,
+                    is_binary=is_binary,
+                    language=language,
+                    max_hashable_bytes=config.max_file_size,
+                )
                 files.append(
                     FileRecord(
                         path=rel_path,
-                        size_bytes=size_bytes,
+                        size_bytes=stat_result.st_size,
                         extension=abs_path.suffix.lower(),
-                        language=_detect_language(abs_path),
+                        language=language,
                         is_binary=is_binary,
-                        content_hash=None if is_binary else _content_hash(abs_path, size_bytes),
+                        content_hash=content_hash,
+                        hash_strategy=hash_strategy,
+                        mtime=stat_result.st_mtime,
                     )
                 )
 

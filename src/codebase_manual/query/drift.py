@@ -1,24 +1,30 @@
-"""Documentation drift: comparing a fresh scan against the last persisted index.
+"""Index drift: comparing a fresh scan against the last persisted index.
 
-Purely a content-hash/path diff -- no interpretation. "Changed" means the
-file's content hash differs from what was last indexed; it says nothing
+Purely a content-hash/metadata diff -- no interpretation. "Changed" means
+the file's fingerprint differs from what was last indexed; it says nothing
 about whether any generated documentation is actually stale, only that the
-underlying facts might be.
+underlying facts might be. Named "index drift," not "documentation drift":
+this never compares generated documentation against code semantics.
+
+Files without a full content hash (binary, or larger than the hashing
+threshold -- see `repository.scanner`) are compared by `size_bytes`/`mtime`
+instead of being treated as unconditionally changed.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from pydantic import BaseModel, Field
 
-from codebase_manual.domain.models import FileRecord
+from codebase_manual.domain.models import FileHashStrategy, FileRecord
 from codebase_manual.persistence.snapshot import RepositorySnapshot
 
 
-@dataclass
-class DriftReport:
-    added_files: list[str] = field(default_factory=list)
-    removed_files: list[str] = field(default_factory=list)
-    changed_files: list[str] = field(default_factory=list)
+class IndexDriftReport(BaseModel):
+    """Pydantic so `cli.main check --json` can serialize it with `.model_dump_json()`."""
+
+    added_files: list[str] = Field(default_factory=list)
+    removed_files: list[str] = Field(default_factory=list)
+    changed_files: list[str] = Field(default_factory=list)
     unchanged_count: int = 0
 
     @property
@@ -26,7 +32,28 @@ class DriftReport:
         return bool(self.added_files or self.removed_files or self.changed_files)
 
 
-def detect_drift(previous: RepositorySnapshot, current_files: list[FileRecord]) -> DriftReport:
+def _is_unchanged(previous: FileRecord, current: FileRecord) -> bool:
+    if (
+        previous.hash_strategy is FileHashStrategy.FULL_HASH
+        and current.hash_strategy is FileHashStrategy.FULL_HASH
+        and previous.content_hash is not None
+        and current.content_hash is not None
+    ):
+        return previous.content_hash == current.content_hash
+
+    # At least one side has no full content hash -- fall back to metadata
+    # rather than treating the file as unconditionally changed.
+    return (
+        previous.mtime is not None
+        and current.mtime is not None
+        and previous.size_bytes == current.size_bytes
+        and previous.mtime == current.mtime
+    )
+
+
+def detect_index_drift(
+    previous: RepositorySnapshot, current_files: list[FileRecord]
+) -> IndexDriftReport:
     previous_by_path = {f.path: f for f in previous.files}
     current_by_path = {f.path: f for f in current_files}
 
@@ -36,14 +63,12 @@ def detect_drift(previous: RepositorySnapshot, current_files: list[FileRecord]) 
     changed: list[str] = []
     unchanged = 0
     for path in sorted(set(current_by_path) & set(previous_by_path)):
-        previous_hash = previous_by_path[path].content_hash
-        current_hash = current_by_path[path].content_hash
-        if previous_hash is None or current_hash is None or previous_hash != current_hash:
-            changed.append(path)
-        else:
+        if _is_unchanged(previous_by_path[path], current_by_path[path]):
             unchanged += 1
+        else:
+            changed.append(path)
 
-    return DriftReport(
+    return IndexDriftReport(
         added_files=added,
         removed_files=removed,
         changed_files=changed,

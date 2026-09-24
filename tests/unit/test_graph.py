@@ -67,6 +67,24 @@ def test_members_of_returns_contains_children() -> None:
     assert [m.target for m in members] == [FUNC_A]
 
 
+def test_transitive_dependents_traversal_reports_no_truncation_within_depth() -> None:
+    graph = _graph()
+    traversal = graph.transitive_dependents_traversal(MOD_A)
+
+    assert set(traversal.entities) == {MOD_B, MOD_C}
+    assert traversal.truncated is False
+
+
+def test_transitive_dependents_traversal_reports_truncation_at_depth_limit() -> None:
+    graph = _graph()
+    traversal = graph.transitive_dependents_traversal(MOD_A, max_depth=1)
+
+    # Only MOD_B is reachable within one hop; MOD_C is one hop further and
+    # was never explored -- this must be reported, not silently omitted.
+    assert traversal.entities == [MOD_B]
+    assert traversal.truncated is True
+
+
 def test_unknown_entity_has_no_edges() -> None:
     graph = _graph()
     unknown = _ref(EntityKind.MODULE, "pkg.unknown")

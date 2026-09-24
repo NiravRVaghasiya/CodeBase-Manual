@@ -37,6 +37,7 @@ def _snapshot() -> RepositorySnapshot:
                     name="GithubProvider",
                     qualified_name="app.auth.providers.github.GithubProvider",
                     bases=["OAuthProvider"],
+                    docstring="OAuth provider backed by the GitHub API.",
                     location=_LOCATION,
                 )
             ],
@@ -88,25 +89,17 @@ def test_plan_change_includes_sibling_files_and_parses_response() -> None:
             "goal": "Add a Google OAuth provider",
             "subsystem": "Authentication / OAuth",
             "implementation_pattern": "GitHub and GitLab providers implement OAuthProvider",
-            "files_to_modify": [
-                {
-                    "path": "app/auth/service.py",
-                    "reasoning": "register the new provider",
-                    "confidence": "medium",
-                }
-            ],
+            "files_to_modify": [{"id": "FILE_003", "reasoning": "register the new provider"}],
             "files_to_create": [
                 {
                     "path": "app/auth/providers/google.py",
                     "reasoning": "new provider, sibling to github.py/gitlab.py",
-                    "confidence": "high",
                 }
             ],
-            "relevant_symbols": ["app.auth.providers.github.GithubProvider"],
+            "relevant_symbols": ["SYMBOL_001"],
             "tests_to_update": [],
             "potential_impact": ["AuthService provider registry"],
             "reasoning": "Follows the existing provider pattern.",
-            "confidence": "high",
         }
     )
     provider = _StubProvider(response=response)
@@ -117,6 +110,85 @@ def test_plan_change_includes_sibling_files_and_parses_response() -> None:
     assert "app/auth/providers/gitlab.py" in (provider.last_prompt or "")
     assert plan.files_to_create[0].path == "app/auth/providers/google.py"
     assert plan.files_to_create[0].action.value == "create"
+    assert plan.files_to_modify[0].path == "app/auth/providers/base.py"
     assert plan.files_to_modify[0].action.value == "modify"
-    assert plan.confidence.value == "high"
+    assert plan.relevant_symbols == ["app.auth.providers.github.GithubProvider"]
+    # All grounded evidence is INFERRED (lexical retrieval) -> MEDIUM, never
+    # taken from the model's own response (the schema no longer has a
+    # confidence field at all).
+    assert plan.confidence.value == "medium"
+    assert plan.grounding.value == "valid"
     assert plan.evidence
+
+
+def test_plan_change_quarantines_an_invented_file_id() -> None:
+    response = json.dumps(
+        {
+            "goal": "Add a Google OAuth provider",
+            "files_to_modify": [{"id": "FILE_999", "reasoning": "invented"}],
+            "files_to_create": [],
+            "relevant_symbols": [],
+            "tests_to_update": [],
+            "potential_impact": [],
+            "reasoning": "Follows the existing provider pattern.",
+        }
+    )
+    provider = _StubProvider(response=response)
+
+    plan = plan_change("Add Google OAuth", _snapshot(), provider)
+
+    assert plan.files_to_modify == []
+    assert plan.grounding.value == "invalid"
+
+
+def test_plan_change_quarantines_invented_ids_independently_per_field() -> None:
+    """A wider hallucination-injection net (Phase 7): invented IDs spread across
+    three fields at once must each be quarantined on their own -- one field's
+    invalid entries must not contaminate a sibling field's valid ones, and the
+    overall verdict must reflect the mix, not collapse to VALID or INVALID.
+    """
+    response = json.dumps(
+        {
+            "goal": "Add a Google OAuth provider",
+            "files_to_modify": [
+                {"id": "FILE_003", "reasoning": "real"},
+                {"id": "FILE_888", "reasoning": "plausible-looking but invented"},
+            ],
+            "files_to_create": [],
+            "relevant_symbols": ["SYMBOL_001", "SYMBOL_777"],
+            "tests_to_update": ["TEST_555"],
+            "potential_impact": [],
+            "reasoning": "Follows the existing provider pattern.",
+        }
+    )
+    provider = _StubProvider(response=response)
+
+    plan = plan_change("Add Google OAuth", _snapshot(), provider)
+
+    assert plan.files_to_modify[0].path == "app/auth/providers/base.py"
+    assert len(plan.files_to_modify) == 1
+    assert plan.relevant_symbols == ["app.auth.providers.github.GithubProvider"]
+    assert plan.tests_to_update == []
+    assert plan.grounding.value == "partially_valid"
+
+
+def test_plan_change_rejects_a_create_path_that_already_exists() -> None:
+    response = json.dumps(
+        {
+            "goal": "Add a Google OAuth provider",
+            "files_to_modify": [],
+            "files_to_create": [
+                {"path": "app/auth/providers/github.py", "reasoning": "sneaks in as 'new'"}
+            ],
+            "relevant_symbols": [],
+            "tests_to_update": [],
+            "potential_impact": [],
+            "reasoning": "Follows the existing provider pattern.",
+        }
+    )
+    provider = _StubProvider(response=response)
+
+    plan = plan_change("Add Google OAuth", _snapshot(), provider)
+
+    assert plan.files_to_create == []
+    assert plan.grounding.value == "invalid"

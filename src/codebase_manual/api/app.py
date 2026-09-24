@@ -16,7 +16,11 @@ from fastapi.templating import Jinja2Templates
 
 from codebase_manual.ai.change_planner import plan_change
 from codebase_manual.ai.impact import analyze_impact, compute_impact_facts
-from codebase_manual.ai.provider import AIProviderNotConfiguredError, AISynthesisError
+from codebase_manual.ai.provider import (
+    AIProviderError,
+    AIProviderNotConfiguredError,
+    AISynthesisError,
+)
 from codebase_manual.ai.qa import answer_question
 from codebase_manual.cli.context import get_provider
 from codebase_manual.domain.models import EntityKind, EntityRef
@@ -37,7 +41,9 @@ class RepositoryNotIndexedError(RuntimeError):
 def _load_snapshot(repository_root: Path) -> RepositorySnapshot:
     identity = repository_identity(repository_root, read_git_metadata(repository_root))
     engine = create_database_engine(default_database_url(repository_root))
-    snapshot = IndexStore(engine).latest_snapshot(identity)
+    snapshot = IndexStore(engine).latest_snapshot(
+        identity, working_copy_root=str(repository_root)
+    )
     if snapshot is None:
         raise RepositoryNotIndexedError(
             f"No index found for {repository_root}. Run `codebase-manual index` first."
@@ -102,7 +108,7 @@ def create_app(repository_root: Path) -> FastAPI:
         answer, error = None, None
         try:
             answer = answer_question(question, snapshot, get_provider())
-        except (AIProviderNotConfiguredError, AISynthesisError) as exc:
+        except (AIProviderNotConfiguredError, AIProviderError, AISynthesisError) as exc:
             error = str(exc)
         return templates.TemplateResponse(
             request, "ask.html", {"answer": answer, "error": error, "question": question}
@@ -120,7 +126,7 @@ def create_app(repository_root: Path) -> FastAPI:
         plan, error = None, None
         try:
             plan = plan_change(change_request, snapshot, get_provider())
-        except (AIProviderNotConfiguredError, AISynthesisError) as exc:
+        except (AIProviderNotConfiguredError, AIProviderError, AISynthesisError) as exc:
             error = str(exc)
         return templates.TemplateResponse(
             request,
@@ -151,7 +157,7 @@ def create_app(repository_root: Path) -> FastAPI:
             try:
                 report = analyze_impact(ref, snapshot, get_provider())
                 explanation = report.explanation
-            except (AIProviderNotConfiguredError, AISynthesisError) as exc:
+            except (AIProviderNotConfiguredError, AIProviderError, AISynthesisError) as exc:
                 explanation = f"AI explanation unavailable: {exc}"
 
         return templates.TemplateResponse(

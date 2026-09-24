@@ -11,21 +11,26 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
+from codebase_manual.analyzer.config import AnalysisContext, detect_source_roots
 from codebase_manual.analyzer.python_analyzer import analyze_module, infer_module_name
 from codebase_manual.domain.models import FileLanguage, PythonModule, ScanResult
 
 
 class LanguageAnalyzer(Protocol):
-    def __call__(self, *, file_path: Path, repo_relative_path: str) -> PythonModule:
+    def __call__(
+        self, *, file_path: Path, repo_relative_path: str, context: AnalysisContext
+    ) -> PythonModule:
         """Extract structural facts from a single source file."""
         ...
 
 
-def _analyze_python_file(*, file_path: Path, repo_relative_path: str) -> PythonModule:
+def _analyze_python_file(
+    *, file_path: Path, repo_relative_path: str, context: AnalysisContext
+) -> PythonModule:
     return analyze_module(
         file_path=file_path,
         repo_relative_path=repo_relative_path,
-        module_name=infer_module_name(repo_relative_path),
+        module_name=infer_module_name(repo_relative_path, context.source_roots),
     )
 
 
@@ -45,6 +50,7 @@ def supported_languages() -> list[FileLanguage]:
 
 def analyze_repository(root: Path, scan_result: ScanResult) -> list[PythonModule]:
     """Analyze every file whose language has a registered analyzer."""
+    context = AnalysisContext(source_roots=detect_source_roots(root))
     modules: list[PythonModule] = []
     for file_record in scan_result.files:
         if file_record.is_binary:
@@ -53,6 +59,10 @@ def analyze_repository(root: Path, scan_result: ScanResult) -> list[PythonModule
         if analyzer is None:
             continue
         modules.append(
-            analyzer(file_path=root / file_record.path, repo_relative_path=file_record.path)
+            analyzer(
+                file_path=root / file_record.path,
+                repo_relative_path=file_record.path,
+                context=context,
+            )
         )
     return modules

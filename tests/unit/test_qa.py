@@ -65,7 +65,7 @@ def test_answer_question_skips_provider_when_no_evidence_found() -> None:
 
 def test_answer_question_synthesizes_from_retrieved_context() -> None:
     response = json.dumps(
-        {"answer": "Authentication is handled by AuthService.", "confidence": "high"}
+        {"answer": "Authentication is handled by AuthService.", "cited_ids": ["FILE_001"]}
     )
     provider = _StubProvider(response=response)
 
@@ -73,8 +73,56 @@ def test_answer_question_synthesizes_from_retrieved_context() -> None:
 
     assert provider.called is True
     assert answer.text == "Authentication is handled by AuthService."
-    assert answer.confidence.value == "high"
+    # Grounded in a single INFERRED (lexical retrieval) citation -> MEDIUM,
+    # never taken from the model's own response.
+    assert answer.confidence.value == "medium"
+    assert answer.grounding.value == "valid"
     assert answer.evidence
+
+
+def test_answer_question_quarantines_a_cited_id_the_model_invented() -> None:
+    response = json.dumps(
+        {
+            "answer": "Authentication is handled by AuthService.",
+            "cited_ids": ["FILE_001", "FILE_999"],
+        }
+    )
+    provider = _StubProvider(response=response)
+
+    answer = answer_question("how does authentication work", _snapshot(), provider)
+
+    assert answer.grounding.value == "partially_valid"
+    assert all(item.file_path != "FILE_999" for item in answer.evidence)
+
+
+def test_answer_question_rejects_when_every_cited_id_is_invented() -> None:
+    response = json.dumps(
+        {"answer": "Authentication is handled by AuthService.", "cited_ids": ["FILE_999"]}
+    )
+    provider = _StubProvider(response=response)
+
+    answer = answer_question("how does authentication work", _snapshot(), provider)
+
+    assert answer.grounding.value == "invalid"
+    assert answer.evidence == []
+    assert answer.confidence.value == "low"
+
+
+def test_answer_question_rejects_a_plausible_looking_id_the_same_as_any_other() -> None:
+    """Widening the hallucination net (Phase 7): an off-by-one guess like `FILE_002`
+    (only `FILE_001` actually exists) is exactly as invented as an obviously wrong ID
+    -- the validator does no fuzzy/nearest-match leniency, so it must be rejected too.
+    """
+    response = json.dumps(
+        {"answer": "Authentication is handled by AuthService.", "cited_ids": ["FILE_002"]}
+    )
+    provider = _StubProvider(response=response)
+
+    answer = answer_question("how does authentication work", _snapshot(), provider)
+
+    assert answer.grounding.value == "invalid"
+    assert answer.evidence == []
+    assert answer.confidence.value == "low"
 
 
 def test_answer_question_raises_on_malformed_response() -> None:

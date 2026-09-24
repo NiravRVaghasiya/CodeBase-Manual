@@ -12,6 +12,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from codebase_manual.ai.grounding import ValidationVerdict
+
 
 class Confidence(StrEnum):
     HIGH = "high"
@@ -55,6 +57,7 @@ class Answer(BaseModel):
     text: str
     confidence: Confidence
     evidence: list[EvidenceItem] = Field(default_factory=list)
+    grounding: ValidationVerdict = ValidationVerdict.VALID
 
 
 class FileRecommendation(BaseModel):
@@ -78,6 +81,7 @@ class ChangePlan(BaseModel):
     reasoning: str
     confidence: Confidence
     evidence: list[EvidenceItem] = Field(default_factory=list)
+    grounding: ValidationVerdict = ValidationVerdict.VALID
 
 
 class ImpactReport(BaseModel):
@@ -88,3 +92,4 @@ class ImpactReport(BaseModel):
     affected_apis: list[str] = Field(default_factory=list)
     explanation: str
     confidence: Confidence
+    truncated: bool = False

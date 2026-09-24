@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from codebase_manual.domain.models import (
+    CallSite,
     ClassSymbol,
     EntityKind,
     EntityRef,
@@ -20,6 +21,7 @@ from codebase_manual.domain.models import (
     PythonModule,
     Relationship,
     RelationshipKind,
+    SourceLocation,
 )
 
 
@@ -39,10 +41,15 @@ def _function_ref(qualified_name: str) -> EntityRef:
     return EntityRef(kind=EntityKind.FUNCTION, identifier=qualified_name)
 
 
-def _is_test_module(module: PythonModule) -> bool:
-    posix_path = module.path.replace("\\", "/")
+def is_test_path(path: str) -> bool:
+    """Whether a repo-relative path looks like a test file, by location or filename."""
+    posix_path = path.replace("\\", "/")
     filename = posix_path.rsplit("/", 1)[-1]
     return f"/{posix_path}/".count("/tests/") > 0 or filename.startswith("test_")
+
+
+def _is_test_module(module: PythonModule) -> bool:
+    return is_test_path(module.path)
 
 
 def _import_statement(imp: ImportedName) -> str:
@@ -58,23 +65,35 @@ class _RepositoryIndex:
     modules_by_name: dict[str, PythonModule] = field(default_factory=dict)
     classes_by_qname: dict[str, ClassSymbol] = field(default_factory=dict)
     functions_by_qname: dict[str, FunctionSymbol] = field(default_factory=dict)
+    # Qualified name (of a module, class, or function/method) -> the module
+    # that defines it. Used to find which module a resolved call/construction
+    # belongs to, e.g. for TESTS evidence.
+    owning_module: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def build(cls, modules: list[PythonModule]) -> _RepositoryIndex:
         index = cls()
         for module in modules:
-            if module.module_name:
-                index.modules_by_name[module.module_name] = module
+            if not module.module_name:
+                continue
+            index.modules_by_name[module.module_name] = module
+            index.owning_module[module.module_name] = module.module_name
             for function in module.functions:
                 index.functions_by_qname[function.qualified_name] = function
+                index.owning_module[function.qualified_name] = module.module_name
             for klass in module.classes:
                 index.classes_by_qname[klass.qualified_name] = klass
+                index.owning_module[klass.qualified_name] = module.module_name
                 for method in klass.methods:
                     index.functions_by_qname[method.qualified_name] = method
+                    index.owning_module[method.qualified_name] = module.module_name
         return index
 
     def resolve_module(self, dotted: str) -> str | None:
         return dotted if dotted in self.modules_by_name else None
+
+    def module_owning(self, ref: EntityRef) -> str | None:
+        return self.owning_module.get(ref.identifier)
 
 
 def _relative_package(module: PythonModule, level: int) -> str | None:
@@ -291,18 +310,21 @@ def _calls_relationships(
             continue
         local_map = local_maps.get(module.module_name, {})
 
-        callers: list[tuple[FunctionSymbol, ClassSymbol | None]] = [
-            (function, None) for function in module.functions
-        ]
-        for klass in module.classes:
-            callers.extend((method, klass) for method in klass.methods)
-
-        for function, owning_class in callers:
+        for function, owning_class in _function_callers(module):
             relationships.extend(
                 _calls_for_function(function, owning_class, module, local_map, index)
             )
 
     return relationships
+
+
+def _call_site_location(call_site: CallSite) -> SourceLocation:
+    return SourceLocation(
+        line_start=call_site.line,
+        line_end=call_site.line,
+        col_start=call_site.column,
+        col_end=None,
+    )
 
 
 def _calls_for_function(
@@ -316,8 +338,8 @@ def _calls_for_function(
     source_ref = _function_ref(function.qualified_name)
     seen: set[str] = set()
 
-    for expression in function.calls:
-        target_ref = _resolve_call(owning_class, expression, local_map, index)
+    for call_site in function.calls:
+        target_ref = _resolve_call(owning_class, call_site.expression, local_map, index)
         if target_ref is None or target_ref.identifier == function.qualified_name:
             continue
         if target_ref.identifier in seen:
@@ -329,46 +351,76 @@ def _calls_for_function(
                 source=source_ref,
                 target=target_ref,
                 evidence=(
-                    f"`{function.qualified_name}` calls `{expression}` at "
-                    f"{module.path}:{function.location.line_start}"
+                    f"`{function.qualified_name}` calls `{call_site.expression}` at "
+                    f"{module.path}:{call_site.line}"
                 ),
-                location=function.location,
+                location=_call_site_location(call_site),
             )
         )
 
     return relationships
 
 
+def _function_callers(module: PythonModule) -> list[tuple[FunctionSymbol, ClassSymbol | None]]:
+    """Every function/method in `module`, paired with its owning class (if any)."""
+    callers: list[tuple[FunctionSymbol, ClassSymbol | None]] = [
+        (function, None) for function in module.functions
+    ]
+    for klass in module.classes:
+        callers.extend((method, klass) for method in klass.methods)
+    return callers
+
+
 def _tests_relationships(
-    modules: list[PythonModule], index: _RepositoryIndex
+    modules: list[PythonModule],
+    local_maps: dict[str, dict[str, str]],
+    index: _RepositoryIndex,
 ) -> list[Relationship]:
+    """TESTS is asserted only from a resolved call, not from an import alone.
+
+    A test module importing a module is not itself evidence that it tests
+    it; a test function *calling* (or constructing) something defined in
+    that module is. This also covers "imports X and directly constructs X"
+    (a constructor call `X(...)` is a call like any other).
+    """
     relationships: list[Relationship] = []
 
     for module in modules:
         if not module.module_name or not _is_test_module(module):
             continue
         source_ref = _module_ref(module.module_name)
+        local_map = local_maps.get(module.module_name, {})
         seen: set[str] = set()
 
-        for imp in module.imports:
-            target_module = _resolve_import_module(module, imp, index)
-            if target_module is None or target_module in seen:
-                continue
-            target_module_obj = index.modules_by_name.get(target_module)
-            if target_module_obj is not None and _is_test_module(target_module_obj):
-                continue
-            seen.add(target_module)
-            relationships.append(
-                Relationship(
-                    kind=RelationshipKind.TESTS,
-                    source=source_ref,
-                    target=_module_ref(target_module),
-                    evidence=(
-                        f"{module.path}:{imp.location.line_start} -- `{_import_statement(imp)}`"
-                    ),
-                    location=imp.location,
+        for function, owning_class in _function_callers(module):
+            for call_site in function.calls:
+                target_ref = _resolve_call(owning_class, call_site.expression, local_map, index)
+                if target_ref is None:
+                    continue
+                target_module = index.module_owning(target_ref)
+                if (
+                    target_module is None
+                    or target_module == module.module_name
+                    or target_module in seen
+                ):
+                    continue
+                target_module_obj = index.modules_by_name.get(target_module)
+                if target_module_obj is not None and _is_test_module(target_module_obj):
+                    continue
+                seen.add(target_module)
+                relationships.append(
+                    Relationship(
+                        kind=RelationshipKind.TESTS,
+                        source=source_ref,
+                        target=_module_ref(target_module),
+                        evidence=(
+                            f"`{function.qualified_name}` calls `{call_site.expression}` "
+                            f"(resolved to `{target_ref.identifier}`) at "
+                            f"{module.path}:{call_site.line}"
+                        ),
+                        location=_call_site_location(call_site),
+                    )
                 )
-            )
 
     return relationships
 
@@ -390,6 +442,6 @@ def build_relationships(modules: list[PythonModule]) -> list[Relationship]:
 
     relationships.extend(_inherits_relationships(modules, local_maps, index))
     relationships.extend(_calls_relationships(modules, local_maps, index))
-    relationships.extend(_tests_relationships(modules, index))
+    relationships.extend(_tests_relationships(modules, local_maps, index))
 
     return relationships

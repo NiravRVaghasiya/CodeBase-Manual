@@ -9,7 +9,7 @@ from codebase_manual.domain.models import (
     PythonModule,
     SourceLocation,
 )
-from codebase_manual.query.api_endpoints import detect_api_endpoints
+from codebase_manual.query.api_endpoints import EndpointDetection, detect_api_endpoints
 
 _LOCATION = SourceLocation(line_start=1, line_end=2)
 
@@ -81,3 +81,34 @@ def test_handles_route_decorator_without_a_literal_path() -> None:
 
     assert endpoints[0].http_method == "DELETE"
     assert endpoints[0].path is None
+    assert endpoints[0].detection is EndpointDetection.METHOD_DECORATOR
+
+
+def test_detects_api_route_decorator_with_multiple_methods() -> None:
+    module = PythonModule(
+        path="app/api/routes.py",
+        module_name="app.api.routes",
+        functions=[
+            _function("health", 'app.api_route("/health", methods=["GET", "HEAD"])')
+        ],
+    )
+
+    endpoints = detect_api_endpoints([module])
+
+    assert {e.http_method for e in endpoints} == {"GET", "HEAD"}
+    assert all(e.path == "/health" for e in endpoints)
+    assert all(e.detection is EndpointDetection.API_ROUTE_DECORATOR for e in endpoints)
+
+
+def test_api_route_decorator_defaults_to_get_without_methods_kwarg() -> None:
+    module = PythonModule(
+        path="app/api/routes.py",
+        module_name="app.api.routes",
+        functions=[_function("ping", 'router.api_route("/ping")')],
+    )
+
+    endpoints = detect_api_endpoints([module])
+
+    assert len(endpoints) == 1
+    assert endpoints[0].http_method == "GET"
+    assert endpoints[0].detection is EndpointDetection.API_ROUTE_DECORATOR

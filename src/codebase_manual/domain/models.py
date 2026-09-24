@@ -60,6 +60,24 @@ class Variable(BaseModel):
     location: SourceLocation
 
 
+class CallSite(BaseModel):
+    """A single call expression found directly in a function's own scope.
+
+    Never includes calls made inside a nested function/lambda/class defined
+    within this function's body -- those belong to that nested scope, not
+    this one. `expression` is the raw, unresolved callee text (e.g.
+    "self.foo", "Bar"); resolution against known symbols happens in
+    `domain.relationships`.
+    """
+
+    model_config = {"frozen": True}
+
+    expression: str
+    line: int
+    column: int | None = None
+    containing_symbol_id: str
+
+
 class FunctionSymbol(BaseModel):
     name: str
     qualified_name: str
@@ -70,9 +88,7 @@ class FunctionSymbol(BaseModel):
     is_method: bool = False
     docstring: str | None = None
     location: SourceLocation
-    # Raw, unresolved callee expressions found in the body (e.g. "self.foo", "Bar").
-    # Resolution against known symbols happens in `domain.relationships`.
-    calls: list[str] = Field(default_factory=list)
+    calls: list[CallSite] = Field(default_factory=list)
 
 
 class ClassSymbol(BaseModel):
@@ -110,6 +126,21 @@ class FileLanguage(StrEnum):
     UNKNOWN = "unknown"
 
 
+class FileHashStrategy(StrEnum):
+    """How `FileRecord.content_hash` (if any) was computed.
+
+    FULL_HASH      -- a hash of the file's entire content; drift detection
+                       can compare hashes directly.
+    METADATA_ONLY  -- no content hash (the file is binary, or larger than
+                       the hashing threshold); drift detection must fall
+                       back to comparing `size_bytes`/`mtime` instead of
+                       treating the file as unconditionally changed.
+    """
+
+    FULL_HASH = "full_hash"
+    METADATA_ONLY = "metadata_only"
+
+
 class FileRecord(BaseModel):
     path: str
     size_bytes: int
@@ -117,6 +148,8 @@ class FileRecord(BaseModel):
     language: FileLanguage
     is_binary: bool = False
     content_hash: str | None = None
+    hash_strategy: FileHashStrategy = FileHashStrategy.METADATA_ONLY
+    mtime: float | None = None
 
 
 class DirectoryRecord(BaseModel):

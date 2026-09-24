@@ -45,7 +45,8 @@ uv run codebase-manual impact /path/to/repository app/auth/service.py
 # Generate the living manual (Markdown).
 uv run codebase-manual manual /path/to/repository --out MANUAL.md
 
-# Compare the working tree against the last index (documentation drift).
+# Compare the working tree against the last index (index drift: file
+# fingerprints only, not a doc-vs-code semantic comparison).
 uv run codebase-manual check /path/to/repository
 
 # Serve the web UI over an already-indexed repository.
@@ -57,6 +58,12 @@ run `index` first. `impact` and `manual` still work without an AI provider
 configured (they report deterministic facts and say so honestly); `ask` and
 `change` require one.
 
+Every command accepts global `--json` (machine-readable output),
+`--verbose` (full tracebacks on failure), and `--quiet` (suppress
+secondary output) flags, and exits with a documented code (0 success, 1
+user error, 2 configuration error, 3 provider error, 4 internal error) --
+see `docs/cli.md`.
+
 ## Configuration
 
 - `CODEBASE_MANUAL_DATABASE_URL` — any SQLAlchemy URL. Defaults to a SQLite
@@ -66,6 +73,9 @@ configured (they report deterministic facts and say so honestly); `ask` and
   `manual`/`impact`. Without it, those commands report the deterministic
   facts they have and say plainly that AI synthesis is unavailable.
 - `CODEBASE_MANUAL_AI_MODEL` — overrides the default Anthropic model.
+- `[tool.codebase-manual]` in `pyproject.toml` — repository-specific
+  settings: `python-source-roots`, `ignored-paths`, `ignored-extensions`,
+  `max-file-size`, `max-context-size`. See `docs/security.md`.
 
 ## Architecture
 
@@ -95,3 +105,15 @@ src/codebase_manual/
   `calls`, `inherits`, and `tests` are derived with concrete syntactic
   evidence; ambiguous references (calls through arbitrary local variables,
   unresolved base classes) are dropped rather than guessed.
+
+## Further documentation
+
+Start with `docs/architecture.md` for the end-to-end pipeline; it links
+out to everything else. In build order: `docs/evidence-model.md`,
+`docs/confidence.md`, `docs/ai-grounding.md` (the AI trust boundary),
+`docs/relationship-model.md`, `docs/retrieval.md`, `docs/indexing.md`,
+`docs/security.md`, `docs/cli.md`, `docs/performance.md`,
+`docs/analyzers.md`, `docs/testing.md`, `docs/contributing.md`.
+`docs/engineering-baseline.md` is the original audit this project's
+9-phase build (0-8) started from; `docs/implementation-plan-remaining-phases.md`
+and `Context.md` track what was done in each phase and why.
