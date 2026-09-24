@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>Change</h1>
+  <form method="post" action="/change">
+    <textarea name="change_request" rows="2" placeholder="Add Google OAuth">{{ change_request }}</textarea>
+    <button type="submit">Plan</button>
+  </form>
+
+  {% if error %}
+    <p class="error">{{ error }}</p>
+  {% endif %}
+
+  {% if plan %}
+    <section>
+      <h2>Goal</h2>
+      <p>{{ plan.goal }}</p>
+      {% if plan.subsystem %}<p><strong>Subsystem:</strong> {{ plan.subsystem }}</p>{% endif %}
+      {% if plan.implementation_pattern %}<p><strong>Pattern:</strong> {{ plan.implementation_pattern }}</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Files to modify</h2>
+      {% if plan.files_to_modify %}
+      <ul>
+        {% for item in plan.files_to_modify %}
+        <li><code>{{ item.path }}</code> (<span class="confidence-{{ item.confidence.value }}">{{ item.confidence.value }}</span>) &mdash; {{ item.reasoning }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}<p>None.</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Files to create</h2>
+      {% if plan.files_to_create %}
+      <ul>
+        {% for item in plan.files_to_create %}
+        <li><code>{{ item.path }}</code> (<span class="confidence-{{ item.confidence.value }}">{{ item.confidence.value }}</span>) &mdash; {{ item.reasoning }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}<p>None.</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Tests to update</h2>
+      {% if plan.tests_to_update %}<ul>{% for t in plan.tests_to_update %}<li><code>{{ t }}</code></li>{% endfor %}</ul>{% else %}<p>None.</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Potential impact</h2>
+      {% if plan.potential_impact %}<ul>{% for i in plan.potential_impact %}<li>{{ i }}</li>{% endfor %}</ul>{% else %}<p>None noted.</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Reasoning</h2>
+      <p>{{ plan.reasoning }}</p>
+      <p>Confidence: <span class="confidence-{{ plan.confidence.value }}">{{ plan.confidence.value }}</span></p>
+    </section>
+  {% endif %}
+{% endblock %}

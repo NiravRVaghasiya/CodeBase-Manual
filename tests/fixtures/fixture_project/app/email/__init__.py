@@ -1,0 +1,1 @@
+"""External email service abstraction."""

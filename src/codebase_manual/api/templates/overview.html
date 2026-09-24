@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>Overview</h1>
+  <table>
+    <tr><th>Repository</th><td><code>{{ snapshot.repository_root }}</code></td></tr>
+    <tr><th>Commit</th><td><code>{{ snapshot.commit_sha or "(none)" }}</code></td></tr>
+    <tr><th>Branch</th><td>{{ snapshot.branch or "(none)" }}</td></tr>
+    <tr><th>Remote</th><td>{{ snapshot.remote_url or "(none)" }}</td></tr>
+    <tr><th>Indexed at</th><td>{{ snapshot.indexed_at }}</td></tr>
+    <tr><th>Files</th><td>{{ snapshot.files|length }}</td></tr>
+    <tr><th>Python modules</th><td>{{ snapshot.modules|length }}</td></tr>
+    <tr><th>Relationships</th><td>{{ snapshot.relationships|length }}</td></tr>
+  </table>
+{% endblock %}

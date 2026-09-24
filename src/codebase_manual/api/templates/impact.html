@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>Impact</h1>
+  <form method="post" action="/impact">
+    <input type="text" name="target" placeholder="app/auth/service.py or app.auth.service.AuthService" value="{{ target }}" />
+    <button type="submit">Analyze</button>
+  </form>
+
+  {% if error %}
+    <p class="error">{{ error }}</p>
+  {% endif %}
+
+  {% if facts %}
+    <section>
+      <h2>Target</h2>
+      <p><code>{{ facts.target.kind.value }}</code> <code>{{ facts.target.identifier }}</code></p>
+    </section>
+
+    <section>
+      <h2>Direct dependents</h2>
+      {% if facts.direct_dependents %}<ul>{% for ref in facts.direct_dependents %}<li><code>{{ ref.identifier }}</code></li>{% endfor %}</ul>{% else %}<p>None.</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Indirect dependents</h2>
+      {% if facts.indirect_dependents %}<ul>{% for ref in facts.indirect_dependents %}<li><code>{{ ref.identifier }}</code></li>{% endfor %}</ul>{% else %}<p>None.</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Affected tests</h2>
+      {% if facts.affected_tests %}<ul>{% for ref in facts.affected_tests %}<li><code>{{ ref.identifier }}</code></li>{% endfor %}</ul>{% else %}<p>None.</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Affected API endpoints</h2>
+      {% if facts.affected_apis %}<ul>{% for api in facts.affected_apis %}<li><code>{{ api }}</code></li>{% endfor %}</ul>{% else %}<p>None.</p>{% endif %}
+    </section>
+
+    {% if explanation %}
+    <section>
+      <h2>Explanation</h2>
+      <p>{{ explanation }}</p>
+    </section>
+    {% endif %}
+  {% endif %}
+{% endblock %}

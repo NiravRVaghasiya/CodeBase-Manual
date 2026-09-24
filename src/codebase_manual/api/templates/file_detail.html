@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+  {% if module is none %}
+    <h1>Not found</h1>
+    <p class="error">No indexed module at <code>{{ file_path }}</code>.</p>
+  {% else %}
+    <h1><code>{{ module.path }}</code></h1>
+    {% if module.docstring %}<p><em>{{ module.docstring }}</em></p>{% endif %}
+
+    <section>
+      <h2>Imports</h2>
+      {% if module.imports %}
+      <ul>
+        {% for imp in module.imports %}
+        <li><code>{% if imp.name %}from {{ imp.module or "." }} import {{ imp.name }}{% else %}import {{ imp.module }}{% endif %}{% if imp.alias %} as {{ imp.alias }}{% endif %}</code></li>
+        {% endfor %}
+      </ul>
+      {% else %}<p>None.</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Classes</h2>
+      {% if module.classes %}
+      <ul>
+        {% for klass in module.classes %}
+        <li><code>{{ klass.qualified_name }}</code>{% if klass.bases %} (bases: {{ klass.bases|join(", ") }}){% endif %}</li>
+        {% endfor %}
+      </ul>
+      {% else %}<p>None.</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Functions</h2>
+      {% if module.functions %}
+      <ul>
+        {% for function in module.functions %}
+        <li><code>{{ function.qualified_name }}</code>{% if function.is_async %} (async){% endif %}</li>
+        {% endfor %}
+      </ul>
+      {% else %}<p>None.</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Depends on</h2>
+      {% if dependencies %}
+      <ul>{% for rel in dependencies %}<li><code>{{ rel.kind.value }}</code> &rarr; <code>{{ rel.target.identifier }}</code></li>{% endfor %}</ul>
+      {% else %}<p>None recorded.</p>{% endif %}
+    </section>
+
+    <section>
+      <h2>Depended on by</h2>
+      {% if dependents %}
+      <ul>{% for rel in dependents %}<li><code>{{ rel.source.identifier }}</code> &rarr; <code>{{ rel.kind.value }}</code></li>{% endfor %}</ul>
+      {% else %}<p>None recorded.</p>{% endif %}
+    </section>
+  {% endif %}
+{% endblock %}

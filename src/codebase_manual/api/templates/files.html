@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>Files</h1>
+  <table>
+    <tr><th>Path</th><th>Module</th><th>Classes</th><th>Functions</th></tr>
+    {% for module in modules %}
+    <tr>
+      <td><a href="/files/{{ module.path }}"><code>{{ module.path }}</code></a></td>
+      <td>{{ module.module_name or "(unresolved)" }}</td>
+      <td>{{ module.classes|length }}</td>
+      <td>{{ module.functions|length }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+{% endblock %}

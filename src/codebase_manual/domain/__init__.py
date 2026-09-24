@@ -1,0 +1,47 @@
+"""Core entities and relationships of the code intelligence model."""
+
+from codebase_manual.domain.models import (
+    ClassSymbol,
+    Decorator,
+    DirectoryRecord,
+    EntityKind,
+    EntityRef,
+    FileLanguage,
+    FileRecord,
+    FunctionSymbol,
+    GitMetadata,
+    ImportedName,
+    Parameter,
+    ParameterKind,
+    PythonModule,
+    Relationship,
+    RelationshipKind,
+    RepositoryRecord,
+    ScanResult,
+    SourceLocation,
+    Variable,
+)
+from codebase_manual.domain.relationships import build_relationships
+
+__all__ = [
+    "build_relationships",
+    "ClassSymbol",
+    "Decorator",
+    "DirectoryRecord",
+    "EntityKind",
+    "EntityRef",
+    "FileLanguage",
+    "FileRecord",
+    "FunctionSymbol",
+    "GitMetadata",
+    "ImportedName",
+    "Parameter",
+    "ParameterKind",
+    "PythonModule",
+    "Relationship",
+    "RelationshipKind",
+    "RepositoryRecord",
+    "ScanResult",
+    "SourceLocation",
+    "Variable",
+]
