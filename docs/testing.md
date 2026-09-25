@@ -30,21 +30,23 @@ directory with its own tests inside it, it's covered by this same
 
 - **Unit** (`tests/unit/`): one concern, hand-built inputs (a `PythonModule`
   constructed directly, a `RepositorySnapshot` built in a local `_snapshot()`
-  helper, a stub `AIProvider`). This is almost everything -- 26 files as of
-  Phase 7, one per `src/codebase_manual/**/*.py` roughly. Includes
-  `test_invariants.py` (Phase 7): property-based, hand-rolled generators
-  (no `hypothesis` dependency), fast enough to stay in the default run --
-  see its module docstring for why a *generator* rather than a handful of
-  hand-picked examples is worth the extra code for the specific invariants
-  it checks.
+  helper, a stub `AIProvider`). This is almost everything -- 27 files, one
+  per `src/codebase_manual/**/*.py` roughly, including
+  `test_typescript_analyzer.py`. Includes `test_invariants.py`: property-based,
+  hand-rolled generators (no `hypothesis` dependency), fast enough to stay in
+  the default run -- see its module docstring for why a *generator* rather
+  than a handful of hand-picked examples is worth the extra code for the
+  specific invariants it checks (including, now, that the generator's
+  dangling references actually produce `UnresolvedCall` facts, not just
+  that nothing is fabricated in their place).
 - **Integration** (`tests/integration/`): the real pipeline against a real
   fixture or a real `tmp_path` repository written to disk --
-  `test_index_fixture.py`/`test_src_layout_fixture.py` run the actual
-  scanner + analyzer against `tests/fixtures/`; `test_security_boundaries.py`
-  round-trips scan -> analyze -> persist -> `ai.qa.answer_question` through
-  a real SQLite file to verify secrets never reach it (`docs/security.md`);
-  `test_web_app.py` exercises `api.app.create_app` with FastAPI's test
-  client.
+  `test_index_fixture.py`/`test_src_layout_fixture.py`/
+  `test_typescript_fixture.py` run the actual scanner + analyzer against
+  `tests/fixtures/`; `test_security_boundaries.py` round-trips scan ->
+  analyze -> persist -> `ai.qa.answer_question` through a real SQLite file
+  to verify secrets never reach it (`docs/security.md`); `test_web_app.py`
+  exercises `api.app.create_app` with FastAPI's test client.
 - **Benchmark** (`scripts/benchmark.py`, Phase 7): a report, not a
   correctness gate -- deliberately outside `tests/` and outside the
   default `pytest` run (`docs/performance.md`). Run it on demand; it
@@ -68,22 +70,36 @@ directory with its own tests inside it, it's covered by this same
 - **`src_layout`**: minimal, exists solely to prove `src/app/service.py`
   resolves to module name `app.service`, not `src.app.service`
   (`analyzer.config.detect_source_roots`).
+- **`typescript_project`**: minimal (two files), proves the second-language
+  architecture end to end -- same-file `INHERITS`/`CALLS` resolution
+  (including `this.`-based inheritance-aware dispatch) through the
+  unmodified `domain.relationships` pipeline, and a cross-file relative
+  import that fails closed as an `UnresolvedCall` rather than resolving by
+  accident (`docs/analyzers.md`). Also exercised by `scripts/benchmark.py`'s
+  accuracy section as a second, distinct-language evaluation corpus.
 
 `docs/performance.md`'s "Fixture breadth: decision" section explains why
-no further dedicated fixture directories were added in Phase 7 (most of
-what they'd cover -- relative imports, aliased imports, nested scopes,
-decorators, async, malformed Python -- is already covered directly in
-`test_python_analyzer.py` without one).
+most Python shapes (relative imports, aliased imports, nested scopes,
+decorators, async, malformed Python) don't have their own dedicated
+fixture directory -- they're already covered directly in
+`test_python_analyzer.py` without one.
 
 ## How to add a grounding test
 
-Every AI-facing feature (`ai.qa`, `ai.change_planner`, `ai.impact`,
-`ai.summarizer`) is grounded the same way: retrieval/computation produces
-facts, a `CandidateSet` gives the model opaque IDs, `GroundingValidator`
-resolves whatever the model cited back against real entities. A grounding
-test proves an invented reference is caught, not proves the feature
-works (that's the rest of the test file). The shape, from
-`test_qa.py`/`test_change_planner.py`:
+Three AI-facing features -- `ai.qa`, `ai.change_planner`, and `ai.impact`
+-- are grounded the same way: retrieval/computation produces facts, a
+`CandidateSet` gives the model opaque IDs (`build_candidate_set` for
+retrieval results, `build_candidate_set_from_refs` for `ai.impact`'s fixed
+fact list), `GroundingValidator` resolves whatever the model cited back
+against real entities. `ai.summarizer` is the one AI-facing feature that
+does *not* use this mechanism -- it paraphrases facts already handed to
+it in the prompt rather than selecting among candidate IDs, and its
+confidence comes from `confidence_for_summary` (docstring/structure
+presence, not citation strength; see `docs/confidence.md`), so there is
+nothing for a grounding test to exercise there. A grounding test proves
+an invented reference is caught, not proves the feature works (that's the
+rest of the test file). The shape, from
+`test_qa.py`/`test_change_planner.py`/`test_impact.py`:
 
 1. Build a `RepositorySnapshot` with a couple of real modules/functions/
    classes (a local `_snapshot()` helper -- copy an existing one, don't

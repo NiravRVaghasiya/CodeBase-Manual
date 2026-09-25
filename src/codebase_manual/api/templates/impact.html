@@ -40,6 +40,14 @@
     <section>
       <h2>Explanation</h2>
       <p>{{ explanation }}</p>
+      {% if evidence %}
+      <h3>Evidence</h3>
+      <ul class="evidence">
+        {% for item in evidence %}
+        <li>{{ item.description }}{% if item.file_path %} (<code>{{ item.file_path }}</code>){% endif %}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
     </section>
     {% endif %}
   {% endif %}

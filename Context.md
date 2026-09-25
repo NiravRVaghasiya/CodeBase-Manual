@@ -582,3 +582,235 @@ both at once -- it's the same underlying analyzer change. Item 3 is a
 separate, larger piece of work (real type inference). None of these are
 blocking anything currently shipped; they're documented limitations, not
 open bugs.
+
+## Follow-up session -- type-aware call resolution, test granularity, impact grounding
+
+A second engineering brief (broader code-intelligence framing, README
+rewrite) was applied on top of the completed 9-phase build above. Rather
+than implement every suggestion in that brief, the session audited current
+state first and found it mapped almost exactly onto the three items in
+"Next step" above -- so this session closed item 3 (partially) and the
+`TESTS`-granularity and `ai.impact`-grounding findings from Phase 7, in
+that order, and left items 1-2 (`CALL_UNKNOWN` fact representation,
+`router.add_api_route(...)` detection) untouched.
+
+**New file:** `domain/type_inference.py` -- best-effort, fail-closed
+attribute/local-variable type resolution (constructor-injected parameters,
+direct construction, dataclass-style class annotations, factory return
+annotations, simple name propagation, inheritance-aware method/attribute
+lookup). Consumes a new fact stream, `Assignment`/`AssignedValueKind`
+(`domain.models`), extracted by the same scoped visitor that already
+extracted `CallSite`s (`analyzer.python_analyzer._ScopedCallVisitor`).
+`domain.relationships._resolve_call` now has 4 resolution levels instead
+of 2; see `docs/relationship-model.md`'s "Type-aware call resolution"
+section for the exact shapes handled and the ones deliberately left
+unresolved. This closes the flagship example from the previous phases'
+"known gap" list: `self._user_repository.get_or_create(...)` now resolves
+to `UserRepository.get_or_create` (verified against the real
+`fixture_project` benchmark, not just synthetic tests --
+`scripts/benchmark.py`'s relationship check that documented this as
+expected-absent now expects it present, and passes).
+
+**`domain.relationships._tests_relationships`** now asserts a
+symbol-level `TESTS` edge (test function -> the specific function/class
+its resolved call reached) alongside the existing module-level edge, so
+`impact <function>`/`impact <class>` can find tests that exercise that
+specific symbol -- previously `TESTS` only ever targeted a module. Still
+bound by "explicit evidence only": a test in the same module with no
+resolved call into the specific symbol gets no symbol-level edge.
+
+**`ai.impact.analyze_impact`** now grounds its free-prose `explanation`
+the same way `ai.qa`/`ai.change_planner` ground theirs: `build_impact_candidates`
+(new) builds a `CandidateSet` directly from the already-computed
+dependents/tests (via a new `query.candidates.build_candidate_set_from_refs`,
+since impact's candidates are a fixed fact list, not a retrieval result),
+the model must cite `cited_ids`, and `GroundingValidator` resolves them
+before they become `ImpactReport.evidence`/`grounding`. This closes a gap
+Phase 7's benchmark explicitly flagged as "structurally unmeasurable."
+`ImpactReport.confidence` is unaffected -- it still comes only from
+`compute_impact_facts`'s dependency-graph evidence, never from citation
+success (see `docs/ai-grounding.md`).
+
+**Docs updated for consistency:** `relationship-model.md` (new section),
+`analyzers.md` (Assignment extraction), `architecture.md` (stale
+"instance-attribute call" example), `performance.md` (5/5 relationship
+checks, narrower TESTS-granularity finding, closed "known unmeasured gap,"
+re-measured numbers), `ai-grounding.md` (impact grounding), `testing.md`
+(corrected an existing overclaim that `ai.summarizer` was grounded the
+same way -- it isn't, and wasn't before this session either), `security.md`
+(the "no structured logger" claim was already stale before this session --
+Phase 6 built `logging_config.py` and it was never fixed; corrected here,
+plus a new named gap: no logging in `domain.relationships`/`query.retrieval`/
+`query.graph`). README.md fully rewritten (see below).
+
+**Test count: 258 -> 281** (23 new: 12 in `test_relationships.py` for the
+new resolution shapes and the fine-grained `TESTS` edge, 5 in
+`test_python_analyzer.py` for `Assignment` extraction, 4 in `test_impact.py`
+for citation grounding/rejection, 3 in `test_candidates.py` for
+`build_candidate_set_from_refs`), plus one existing invariant test
+(`test_invariants.py`) rewritten rather than weakened, since the new
+symbol-level `TESTS` edges genuinely changed what it needed to assert.
+Gate status: 281/281 passing, mypy strict clean, ruff clean.
+
+**Deliberately not done this session** (scoped out after auditing, not
+missed): a general relationship-kind vocabulary expansion
+(`DEPENDS_ON`/`EXPOSES`/`CONFIGURES`/`READS`/`WRITES`) -- nothing in the
+current analyzer produces deterministic evidence for these beyond what
+`CONTAINS`/`IMPORTS`/`CALLS`/`INHERITS`/`TESTS` already cover, and
+inventing a relationship kind with no real evidence source would violate
+the project's core rule; hybrid/semantic retrieval -- the existing
+multi-signal explainable retrieval is sound and nothing in this session's
+findings justified adding embedding infrastructure; incremental
+analysis beyond existing fingerprinting -- correctness wasn't at risk and
+this wasn't the highest-value gap found; comprehensive structured logging
+across `domain.relationships`/`query.retrieval`/`query.graph` -- named as
+a gap in `docs/security.md` rather than speculatively built.
+
+## Follow-up session 2 -- all 5 previously-named recommended next steps
+
+The prior session's final report recommended 5 concrete next steps; this
+session implemented all 5, in the order they were listed (the first
+unlocked the third and fourth of the CLI/analyzer gaps described below).
+
+**1. `CallSite` argument capture -> `CALL_UNKNOWN` + `add_api_route`
+detection.** `domain.models.CallArgument`/`CallSite.arguments` (positional
+and keyword, with `*args`/`**kwargs` markers preserved). `PythonModule`
+gained a `calls: list[CallSite]` field for module-level (not-inside-any-
+function) calls, extracted by reusing `_ScopedCallVisitor` over `tree.body`
+-- previously invisible to everything downstream. `domain.models.
+UnresolvedCall` (source, expression, location) is produced by a new
+`domain.relationships.build_relationships_with_unresolved` (`
+build_relationships` is now a thin wrapper over it) whenever `_resolve_call`
+returns `None`; persisted via a new `unresolved_calls` table
+(`persistence.orm.UnresolvedCallORM`) and surfaced in `cli.main index`'s
+summary/JSON output and structured logs. `query.api_endpoints` now detects
+`router.add_api_route(path, handler, methods=[...])` using the new argument
+facts, resolving the handler only when it's a bare name defined in the same
+module (cross-module handler resolution was out of scope -- produces
+`function_qualified_name=None` rather than a guess, still records the
+path/method as real evidence).
+
+**2. Structured logging in `domain.relationships`/`query.retrieval`/
+`query.graph`.** `build_relationships_with_unresolved` logs a per-kind
+relationship-count summary plus unresolved-call count; DEBUG-logs each
+unresolved call's source/expression/location. `retrieve_relevant` logs a
+lexical-vs-expanded summary; DEBUG-logs each graph-expansion addition with
+the same `detail` text `MatchSignal` already carried (closing "why was
+this entity retrieved" as a log-visible question, not just a queryable
+field). `RelationshipGraph.transitive_dependents_traversal` logs
+truncation. All three modules previously had zero logging (a gap named in
+the prior session's `docs/security.md` update).
+
+**3. TypeScript analyzer (`analyzer/typescript_analyzer.py`), second
+`LanguageAnalyzer`.** No `pip`/`uv` was available in this environment to
+install `tree-sitter` (checked; `import tree_sitter` failed, no package
+manager reachable) -- built as a deliberately conservative brace-depth
+scanner over regex-recognized declaration shapes instead of a real parser,
+consistent with the project's dependency-minimalism precedent. Extracts
+imports, top-level/nested `function` declarations, `class` declarations
+with `extends` and their methods, and scoped call expressions (including
+`new Name(...)`), attributing calls to the innermost function/method scope
+and dropping (not misattributing) calls made directly in a class body.
+Produces the same `PythonModule` shape the Python analyzer does.
+**`domain.relationships._resolve_call` needed exactly one change** to work
+identically over these facts: recognizing `this` as a self-reference
+alongside Python's `self`/`cls`. Verified end to end (not just unit tests):
+`tests/fixtures/typescript_project` + `tests/integration/
+test_typescript_fixture.py` prove same-file `CONTAINS`/`INHERITS`/`CALLS`
+resolve (including inheritance-aware dispatch through `this.`) with zero
+other changes to `domain/`, `query/`, `persistence/`, `ai/`, `cli/`, or
+`api/`; a live CLI smoke test (`index` + `impact`) against a pure-TypeScript
+fixture worked identically to Python. Disclosed, real gaps (in the
+module's own docstring and `docs/analyzers.md`): no `Assignment` extraction
+at all for TypeScript (so `this.attr.method()` doesn't resolve, only
+`this.method()`), template-literal interpolation not scanned, regex
+literals not specially recognized, and cross-file relative-import
+resolution doesn't work (`_resolve_import_module`'s logic assumes Python
+package semantics) -- verified failing closed as an `UnresolvedCall`, not
+a fabricated relationship, not just asserted.
+
+Found and fixed a related pre-existing inconsistency while building this:
+`ai.summary_cache`'s own `ANALYSIS_VERSION` constant and the new
+incremental-analysis version tag were the same concept (both answer "is
+this `PythonModule` shape still what the current analyzer would produce")
+tracked in two places that could drift out of sync. Unified into
+`domain.models.PYTHON_MODULE_SCHEMA_VERSION`, imported by both. Also
+discovered and preserved (rather than accidentally violating) a real
+layering constraint while designing the incremental-analysis entry point:
+`repository/scanner.py` already imports from `analyzer/config.py`, so
+`analyzer/` importing back from `repository/`, `persistence/`, or `query/`
+would create a real circular import -- `analyzer.registry.
+analyze_repository_incremental` therefore takes raw `list[FileRecord]`/
+`list[PythonModule]`/`str | None` primitives rather than a
+`RepositorySnapshot`, and the shared fingerprint-comparison logic
+(`file_fingerprint_matches`) lives in `domain.models` (the one place with
+no risk of a cycle), not in `query.drift` (which `analyzer` would then
+have had to import).
+
+**4. Incremental analysis.** `analyzer.registry.analyze_repository_incremental`
+reuses a previous index run's `PythonModule` for any file whose fingerprint
+matches (`domain.models.file_fingerprint_matches` -- the same check
+`query.drift.detect_index_drift` uses, now shared rather than duplicated)
+instead of re-parsing it, as long as the previous run's `analyzer_version`
+(new `persistence.orm.IndexRunORM.analyzer_version` column, stamped with
+`PYTHON_MODULE_SCHEMA_VERSION` on every save) matches the current one --
+otherwise the *whole* previous run is ignored for reuse purposes, not
+just the mismatched files. `cli.main index` fetches the previous snapshot
+before analyzing and passes it through; `analyze_repository` (the simple,
+non-incremental entry point) is now a thin wrapper with empty previous-run
+arguments. Deliberately **not** incremental relationship derivation --
+`build_relationships_with_unresolved` always recomputes the full graph
+from whichever modules come back, since relationship-derivation time is
+small relative to re-parsing at every measured size (correctness over a
+partial graph diff, per the standing "correctness over micro-optimization"
+guidance). Verified live on `tests/fixtures/fixture_project` (21 files): an
+unchanged re-index reuses 21/21 (0 re-analyzed) and produces byte-identical
+relationships; a one-file edit reuses 20/21.
+
+**5. Larger, more diverse evaluation corpus.** `scripts/benchmark.py
+accuracy` now also runs `TYPESCRIPT_RELATIONSHIP_CHECKS` against
+`tests/fixtures/typescript_project` (4/4 pass, including the
+deliberately-expected-absent cross-file-import check from item 3) --
+diversifying the accuracy corpus beyond one Python fixture, proportionate
+to the TypeScript analyzer's own proof-of-architecture scope, not a claim
+of general TypeScript accuracy.
+
+**Docs updated:** `architecture.md` (CALL_UNKNOWN closed, incremental
+analysis, TypeScript in the pipeline diagram), `cli.md` (logging, `
+add_api_route` detection, the "relationships unresolved" gap closed),
+`security.md` (the `domain.relationships`/`query.retrieval`/`query.graph`
+no-logging gap closed), `analyzers.md` (substantially rewritten: real
+TypeScript section, "what a third language would need" replacing "what a
+second language would need," and the `PythonModule`-rename section
+updated to explain why the now-met trigger condition still wasn't acted on
+-- purely cosmetic, high-blast-radius, not worth the risk bundled into this
+session), `relationship-model.md` (`this` recognition, module-level calls,
+`UnresolvedCall` cross-reference), `indexing.md` (new "Incremental
+analysis" section), `performance.md` (TypeScript accuracy section, a note
+that the synthetic performance table always measures full analysis by
+construction), `testing.md` (new fixture/test files). README fully updated
+(capabilities, limitations, roadmap, architecture diagram, project layout,
+contributing) rather than patched around the edges.
+
+**Test count: 281 -> 342** (61 new, gate status 342/342 passing, mypy
+strict clean, ruff clean): `test_python_analyzer.py` (+4, argument capture
+and module-level calls), `test_relationships.py` (+4, `UnresolvedCall` and
+module-level `CALLS`), `test_invariants.py` (generator extended with a
+module-level call statement; two tests rewritten, two added, for
+`UnresolvedCall` coverage on realistic generated code, not just hand-built
+examples), `test_api_endpoints.py` (+6, `add_api_route`), `test_persistence.py`
+(+2, `unresolved_calls`/`analyzer_version` round-trip), `test_registry.py`
+(+7, TypeScript registration + incremental reuse/reanalyze/version-mismatch/
+no-previous-run cases), `test_typescript_analyzer.py` (new file, 17 tests),
+`test_typescript_fixture.py` (new file, 4 integration tests).
+
+**Deliberately not done this session:** renaming `PythonModule` (the
+trigger condition -- "a second language actually built" -- is now met, but
+the rename is purely cosmetic and touches every layer; explained in
+`docs/analyzers.md` rather than bundled in); a real TypeScript parser
+(no installable dependency in this environment); TypeScript assignment/
+attribute-type extraction (would need its own design for `this.x = y`
+constructor-parameter-property shorthand and class-field initializers,
+not just a copy of the Python approach); a general relationship-kind
+vocabulary expansion or hybrid/semantic retrieval (still no new evidence
+source or measured need for either, same reasoning as the prior session).

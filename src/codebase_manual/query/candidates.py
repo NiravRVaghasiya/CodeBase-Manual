@@ -71,6 +71,55 @@ class CandidateSet:
         return "\n".join(lines)
 
 
+def _looks_like_test(ref: EntityRef) -> bool:
+    """Whether `ref` names a test entity, for a MODULE/FUNCTION identifier (dotted) or a
+    FILE identifier (a repo-relative path) -- `is_test_path` expects path-shaped input,
+    so a dotted name is converted to a path shape first (`pkg.test_x` -> `pkg/test_x`).
+    """
+    return is_test_path(ref.identifier.replace(".", "/"))
+
+
+def build_candidate_set_from_refs(refs: list[EntityRef]) -> CandidateSet:
+    """Assign candidate IDs directly to a fixed, already-computed list of entity refs.
+
+    Unlike `build_candidate_set`, this has no retrieval result to draw
+    labels/signals from -- it exists for callers whose candidates are a
+    deterministic fact list rather than a retrieval result (e.g. impact
+    analysis's dependents/tests), so free prose can still cite by ID instead
+    of writing out raw identifiers a model could later invent variations on.
+    Duplicate refs are assigned only one ID each, in first-seen order.
+    """
+    files: list[Candidate] = []
+    symbols: list[Candidate] = []
+    tests: list[Candidate] = []
+    file_i = test_i = symbol_i = 1
+    seen: set[EntityRef] = set()
+
+    for ref in refs:
+        if ref in seen:
+            continue
+        seen.add(ref)
+
+        if ref.kind in (EntityKind.FILE, EntityKind.MODULE):
+            if _looks_like_test(ref):
+                tests.append(Candidate(id=f"TEST_{test_i:03d}", ref=ref, label=ref.identifier))
+                test_i += 1
+            else:
+                files.append(Candidate(id=f"FILE_{file_i:03d}", ref=ref, label=ref.identifier))
+                file_i += 1
+        elif ref.kind in (EntityKind.FUNCTION, EntityKind.CLASS):
+            if _looks_like_test(ref):
+                tests.append(Candidate(id=f"TEST_{test_i:03d}", ref=ref, label=ref.identifier))
+                test_i += 1
+            else:
+                symbols.append(
+                    Candidate(id=f"SYMBOL_{symbol_i:03d}", ref=ref, label=ref.identifier)
+                )
+                symbol_i += 1
+
+    return CandidateSet(files=files, symbols=symbols, tests=tests)
+
+
 def build_candidate_set(retrieval: RetrievalResult) -> CandidateSet:
     """Assign stable candidate IDs to a retrieval result's files, tests, and symbols."""
     files: list[Candidate] = []

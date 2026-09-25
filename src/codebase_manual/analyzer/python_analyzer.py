@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from codebase_manual.domain.models import (
+    AssignedValueKind,
+    Assignment,
+    CallArgument,
     CallSite,
     ClassSymbol,
     Decorator,
@@ -124,6 +127,24 @@ def _extract_parameters(args: ast.arguments) -> list[Parameter]:
     return parameters
 
 
+def _call_arguments(node: ast.Call) -> list[CallArgument]:
+    """Unparsed positional/keyword arguments of a call expression.
+
+    A `*args`-unpacked positional argument or a `**kwargs`-unpacked keyword
+    argument (`ast.keyword` with `arg is None`) keeps its unpack marker in
+    `value` (`ast.unparse` already renders `*x`; `**kwargs` unpacking is
+    rendered explicitly here since `ast.unparse` has no leading marker to
+    reuse for a bare `keyword.value`).
+    """
+    arguments = [CallArgument(value=_unparse(arg) or "") for arg in node.args]
+    for keyword in node.keywords:
+        if keyword.arg is None:
+            arguments.append(CallArgument(value=f"**{_unparse(keyword.value)}"))
+        else:
+            arguments.append(CallArgument(value=_unparse(keyword.value) or "", keyword=keyword.arg))
+    return arguments
+
+
 def _extract_decorators(decorator_list: list[ast.expr]) -> list[Decorator]:
     return [
         Decorator(expression=_unparse(node) or "", location=_location(node))
@@ -171,6 +192,7 @@ class _ScopedCallVisitor(ast.NodeVisitor):
     def __init__(self, containing_symbol_id: str) -> None:
         self._containing_symbol_id = containing_symbol_id
         self.calls: list[CallSite] = []
+        self.assignments: list[Assignment] = []
 
     def visit_Call(self, node: ast.Call) -> None:
         callee = _unparse(node.func)
@@ -181,9 +203,66 @@ class _ScopedCallVisitor(ast.NodeVisitor):
                     line=node.lineno,
                     column=node.col_offset,
                     containing_symbol_id=self._containing_symbol_id,
+                    arguments=_call_arguments(node),
                 )
             )
         self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            self._record_assignment(target, node.value, node.lineno)
+        # Still descend into targets and value as generic_visit normally
+        # would (e.g. a call in a subscript target's key, or in the value) --
+        # recording an assignment fact is additive, not a replacement.
+        self.generic_visit(node)
+
+    def _record_assignment(self, target: ast.expr, value: ast.expr, line: int) -> None:
+        target_info = self._target_name(target)
+        if target_info is None:
+            return
+        is_attribute, name = target_info
+        value_info = self._classify_value(value)
+        if value_info is None:
+            return
+        kind, text = value_info
+        self.assignments.append(
+            Assignment(
+                target=name,
+                is_attribute=is_attribute,
+                value_kind=kind,
+                value_expression=text,
+                line=line,
+            )
+        )
+
+    @staticmethod
+    def _target_name(target: ast.expr) -> tuple[bool, str] | None:
+        """`(is_attribute, name)` for a plain local name or a `self./cls.` attribute.
+
+        Anything else (tuple/list unpacking, subscripts, arbitrary attribute
+        chains) carries no usable type information and is not recorded.
+        """
+        if isinstance(target, ast.Name):
+            return False, target.id
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in ("self", "cls")
+        ):
+            return True, target.attr
+        return None
+
+    @staticmethod
+    def _classify_value(value: ast.expr) -> tuple[AssignedValueKind, str] | None:
+        if isinstance(value, ast.Call):
+            callee = _unparse(value.func)
+            return (AssignedValueKind.CALL, callee) if callee else None
+        if isinstance(value, ast.Name):
+            return AssignedValueKind.NAME, value.id
+        if isinstance(value, ast.Attribute):
+            text = _unparse(value)
+            return (AssignedValueKind.ATTRIBUTE, text) if text else None
+        return None
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_def_time_expressions(node)
@@ -223,11 +302,22 @@ class _ScopedCallVisitor(ast.NodeVisitor):
                 self.visit(arg.annotation)
 
 
-def _extract_calls(node: _FunctionNode, containing_symbol_id: str) -> list[CallSite]:
+def _extract_scope_facts(
+    statements: Sequence[ast.stmt], containing_symbol_id: str
+) -> tuple[list[CallSite], list[Assignment]]:
+    """Calls and assignments directly in one scope's own statement list.
+
+    Used for a function/method body (`node.body`) and, with `tree.body`,
+    for module-level statements -- `_ScopedCallVisitor` stops at nested
+    `def`/`async def`/`class`/`lambda` boundaries either way, so top-level
+    calls (e.g. `router.add_api_route(...)` written directly in a module,
+    not inside a function) are captured without leaking into or out of any
+    function's own scope.
+    """
     visitor = _ScopedCallVisitor(containing_symbol_id)
-    for statement in node.body:
+    for statement in statements:
         visitor.visit(statement)
-    return visitor.calls
+    return visitor.calls, visitor.assignments
 
 
 _ScopeDef = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
@@ -287,6 +377,7 @@ def _extract_function(
     node: _FunctionNode, qualified_prefix: str, *, is_method: bool
 ) -> tuple[FunctionSymbol, _NestedSymbols]:
     qualified_name = _qualify(qualified_prefix, node.name)
+    calls, assignments = _extract_scope_facts(node.body, qualified_name)
     symbol = FunctionSymbol(
         name=node.name,
         qualified_name=qualified_name,
@@ -297,7 +388,8 @@ def _extract_function(
         is_method=is_method,
         docstring=ast.get_docstring(node),
         location=_location(node),
-        calls=_extract_calls(node, qualified_name),
+        calls=calls,
+        assignments=assignments,
     )
     return symbol, _extract_nested_defs(node.body, qualified_name)
 
@@ -306,9 +398,7 @@ def _simple_assign_targets(node: ast.Assign) -> list[ast.Name]:
     return [target for target in node.targets if isinstance(target, ast.Name)]
 
 
-def _extract_class(
-    node: ast.ClassDef, qualified_prefix: str
-) -> tuple[ClassSymbol, _NestedSymbols]:
+def _extract_class(node: ast.ClassDef, qualified_prefix: str) -> tuple[ClassSymbol, _NestedSymbols]:
     qualified_name = _qualify(qualified_prefix, node.name)
     methods: list[FunctionSymbol] = []
     class_variables: list[Variable] = []
@@ -420,6 +510,8 @@ def analyze_module(
                     )
                 )
 
+    module_calls, _module_assignments = _extract_scope_facts(tree.body, prefix or "<module>")
+
     return PythonModule(
         path=repo_relative_path,
         module_name=module_name,
@@ -428,4 +520,5 @@ def analyze_module(
         functions=functions,
         classes=classes,
         variables=variables,
+        calls=module_calls,
     )

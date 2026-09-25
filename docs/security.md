@@ -93,17 +93,41 @@ limits.
 
 ## Logging
 
-No structured logger exists yet (planned for Phase 6 -- see
-`docs/implementation-plan-remaining-phases.md`). The current `typer.echo`
-call sites in `cli/main.py` were audited: none echo an API key, `.env`
-content, or raw source text -- they print `Answer`/`ChangePlan`/`ImpactReport`
-prose (AI-generated interpretation, not repository secrets) and
-deterministic fact counts. `ai/anthropic_provider.py` reads
-`ANTHROPIC_API_KEY` from the environment and never logs or echoes it.
-Rule of thumb for future call sites: never format a `FileRecord`'s raw
-bytes, a `.env*` file's content, or an `AIProvider`'s API key into any
-echoed/logged string -- only paths, hashes, counts, and AI-generated
-prose are safe to surface.
+`logging_config.configure_logging()`/`get_logger(name)` set up a
+per-module `logging.Logger` (module-qualified names like `ai.qa`,
+`ai.anthropic_provider`, `cli`), gated by the CLI's `--verbose`/`--quiet`
+flags and called once from `cli.main.main()`'s Typer callback. Existing
+call sites log counts and outcomes, never content: `ai.qa`/
+`ai.change_planner` log retrieval result counts
+(`retrieval found files=%d symbols=%d chains=%d`) and, when
+`GroundingValidator` rejects a citation, a warning with the rejected/cited
+counts and verdict (`grounding rejected %d/%d cited ids verdict=%s`) --
+`ai.impact` logs the same rejection shape for its own citations (see
+`docs/ai-grounding.md`). `ai.anthropic_provider` logs request
+outcome/duration, never prompt or response text. `cli.main`'s `index`
+command logs start and finish with file/module/relationship counts.
+
+The `typer.echo` call sites in `cli/main.py` were separately audited: none
+echo an API key, `.env` content, or raw source text -- they print
+`Answer`/`ChangePlan`/`ImpactReport` prose (AI-generated interpretation,
+not repository secrets) and deterministic fact counts.
+`ai/anthropic_provider.py` reads `ANTHROPIC_API_KEY` from the environment
+and never logs or echoes it. Rule of thumb for future call sites: never
+format a `FileRecord`'s raw bytes, a `.env*` file's content, or an
+`AIProvider`'s API key into any echoed/logged string -- only paths,
+hashes, counts, and AI-generated prose are safe to surface.
+
+`domain.relationships`, `query.retrieval`, and `query.graph` now log too:
+`build_relationships_with_unresolved` logs a per-kind relationship count
+plus the unresolved-call count on every run, and DEBUG-logs each
+unresolved call's source/expression/location; `retrieve_relevant` logs a
+summary (lexical vs. expanded file/symbol counts, chain count) and
+DEBUG-logs each entity graph expansion added, with the same `detail` text
+`MatchSignal` already carries -- "why was this entity retrieved" now has a
+log line, not just a queryable field on the result; `RelationshipGraph.
+transitive_dependents_traversal` logs when it truncates. All of these
+follow the same rule as everything else here: paths, identifiers, counts,
+and match reasons only -- never file content.
 
 ## Verifying the boundary
 

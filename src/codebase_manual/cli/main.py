@@ -9,6 +9,7 @@ import typer
 from pydantic import BaseModel
 
 from codebase_manual.ai.change_planner import plan_change
+from codebase_manual.ai.grounding import ValidationVerdict
 from codebase_manual.ai.impact import (
     ImpactFacts,
     analyze_impact,
@@ -16,14 +17,14 @@ from codebase_manual.ai.impact import (
     confidence_for_impact_facts,
 )
 from codebase_manual.ai.manual import generate_manual
-from codebase_manual.ai.models import Confidence, FileRecommendation, ImpactReport
+from codebase_manual.ai.models import Confidence, EvidenceItem, FileRecommendation, ImpactReport
 from codebase_manual.ai.provider import (
     AIProviderError,
     AIProviderNotConfiguredError,
     AISynthesisError,
 )
 from codebase_manual.ai.qa import answer_question
-from codebase_manual.analyzer.registry import analyze_repository
+from codebase_manual.analyzer.registry import analyze_repository_incremental
 from codebase_manual.cli.context import (
     CliState,
     cli_state,
@@ -36,9 +37,10 @@ from codebase_manual.cli.context import (
 )
 from codebase_manual.cli.exit_codes import ExitCode
 from codebase_manual.domain.models import EntityRef
-from codebase_manual.domain.relationships import build_relationships
+from codebase_manual.domain.relationships import build_relationships_with_unresolved
 from codebase_manual.logging_config import configure_logging, get_logger
 from codebase_manual.persistence.snapshot import RepositorySnapshot
+from codebase_manual.persistence.store import repository_identity
 from codebase_manual.query.drift import detect_index_drift
 from codebase_manual.repository.scanner import RepositoryScanner
 
@@ -58,6 +60,7 @@ class IndexSummary(BaseModel):
     classes: int
     imports: int
     relationships: int
+    unresolved_calls: int
     ignored: int
     parse_errors: int
     commit_sha: str | None
@@ -89,11 +92,19 @@ def index(ctx: typer.Context, repository_path: Path = _REPO_ARG) -> None:
     _logger.info("index started repo=%s", repository_path)
     scanner = RepositoryScanner(repository_path)
     scan_result = scanner.scan()
-    modules = analyze_repository(scanner.root, scan_result)
-    relationships = build_relationships(modules)
 
     store = open_store(scanner.root)
-    store.save(scan_result, modules, relationships)
+    identity = repository_identity(scan_result)
+    previous = store.latest_snapshot(identity, working_copy_root=str(scanner.root))
+    modules = analyze_repository_incremental(
+        scanner.root,
+        scan_result,
+        previous_files=previous.files if previous else [],
+        previous_modules=previous.modules if previous else [],
+        previous_analyzer_version=previous.analyzer_version if previous else None,
+    )
+    result = build_relationships_with_unresolved(modules)
+    store.save(scan_result, modules, result.relationships, result.unresolved_calls)
 
     duration = time.perf_counter() - started
     parse_errors = [m for m in modules if m.parse_error]
@@ -104,17 +115,19 @@ def index(ctx: typer.Context, repository_path: Path = _REPO_ARG) -> None:
         functions=sum(len(m.functions) for m in modules),
         classes=sum(len(m.classes) for m in modules),
         imports=sum(len(m.imports) for m in modules),
-        relationships=len(relationships),
+        relationships=len(result.relationships),
+        unresolved_calls=len(result.unresolved_calls),
         ignored=len(scan_result.ignored_file_paths),
         parse_errors=len(parse_errors),
         commit_sha=scan_result.repository.git.commit_sha,
         duration_seconds=round(duration, 2),
     )
     _logger.info(
-        "index finished files=%d modules=%d relationships=%d duration=%.2fs",
+        "index finished files=%d modules=%d relationships=%d unresolved_calls=%d duration=%.2fs",
         summary.files,
         summary.modules,
         summary.relationships,
+        summary.unresolved_calls,
         duration,
     )
 
@@ -133,6 +146,8 @@ def index(ctx: typer.Context, repository_path: Path = _REPO_ARG) -> None:
     typer.echo(f"Classes:       {summary.classes}")
     typer.echo(f"Imports:       {summary.imports}")
     typer.echo(f"Relationships: {summary.relationships}")
+    if summary.unresolved_calls:
+        typer.echo(f"Unresolved calls: {summary.unresolved_calls}")
     if summary.ignored:
         typer.echo(f"Ignored:       {summary.ignored}")
     if summary.parse_errors:
@@ -222,7 +237,7 @@ def impact(
     snapshot = load_snapshot_or_exit(repository_path, verbose=state.verbose)
     ref = resolve_entity_ref(target, snapshot, verbose=state.verbose)
     facts = compute_impact_facts(ref, snapshot)
-    explanation, confidence = _impact_explanation(ref, snapshot, facts, state)
+    explanation, confidence, evidence, grounding = _impact_explanation(ref, snapshot, facts, state)
 
     if state.json_output:
         report = ImpactReport(
@@ -234,6 +249,8 @@ def impact(
             explanation=explanation,
             confidence=confidence,
             truncated=facts.truncated,
+            evidence=evidence,
+            grounding=grounding,
         )
         typer.echo(report.model_dump_json())
         return
@@ -252,21 +269,32 @@ def impact(
 
     typer.echo("")
     typer.echo(f"Explanation: {explanation}")
-    if not state.quiet:
-        typer.echo(f"Confidence: {confidence.value}")
+    if state.quiet:
+        return
+    typer.echo(f"Confidence: {confidence.value}")
+    if evidence:
+        typer.echo("Explanation evidence:")
+        for item in evidence:
+            location = f" ({item.file_path})" if item.file_path else ""
+            typer.echo(f"  - {item.description}{location}")
 
 
 def _impact_explanation(
     ref: EntityRef, snapshot: RepositorySnapshot, facts: ImpactFacts, state: CliState
-) -> tuple[str, Confidence]:
+) -> tuple[str, Confidence, list[EvidenceItem], ValidationVerdict]:
     """`impact` degrades gracefully on a known AI failure (facts stand alone without
     an explanation); only a genuinely unexpected error is treated as INTERNAL_ERROR.
     """
     try:
         report = analyze_impact(ref, snapshot, get_provider())
-        return report.explanation, report.confidence
+        return report.explanation, report.confidence, report.evidence, report.grounding
     except (AIProviderNotConfiguredError, AIProviderError, AISynthesisError) as exc:
-        return f"AI explanation unavailable: {exc}", confidence_for_impact_facts(facts)
+        return (
+            f"AI explanation unavailable: {exc}",
+            confidence_for_impact_facts(facts),
+            [],
+            ValidationVerdict.VALID,
+        )
     except Exception as exc:  # noqa: BLE001
         fail(
             f"Could not compute impact: unexpected error: {exc}",

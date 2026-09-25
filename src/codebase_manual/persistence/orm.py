@@ -1,9 +1,18 @@
 """SQLAlchemy schema for persisted repository intelligence.
 
 Deliberately small: `repositories`, `working_copies`, `index_runs`,
-`files`, `symbols`, `relationships`, `ai_cache`. Symbol- and relationship-
-specific detail is kept in a JSON payload rather than further normalized
-tables, per the plan's guidance to add tables only when justified.
+`files`, `symbols`, `relationships`, `unresolved_calls`, `ai_cache`.
+Symbol- and relationship-specific detail is kept in a JSON payload rather
+than further normalized tables, per the plan's guidance to add tables only
+when justified.
+
+`IndexRunORM.analyzer_version` stamps each run with `domain.models.
+PYTHON_MODULE_SCHEMA_VERSION` at the time it was written -- `analyzer.
+registry.analyze_repository_incremental` refuses to reuse a previous run's
+`PythonModule`s if this doesn't match the current version, rather than
+silently reusing facts an older analyzer produced. No migration tooling
+exists for schema changes (this column included) -- an existing local
+SQLite index created before this column existed needs re-indexing.
 
 `RepositoryORM` identifies a *logical* repository (its Git remote, or its
 root path when there is none). `WorkingCopyORM` identifies one checkout of
@@ -69,6 +78,7 @@ class IndexRunORM(Base):
     is_dirty: Mapped[bool | None]
     remote_url: Mapped[str | None]
     indexed_at: Mapped[datetime]
+    analyzer_version: Mapped[str | None]
 
     repository: Mapped[RepositoryORM] = relationship(back_populates="index_runs")
     working_copy: Mapped[WorkingCopyORM] = relationship(back_populates="index_runs")
@@ -79,6 +89,9 @@ class IndexRunORM(Base):
         back_populates="index_run", cascade="all, delete-orphan"
     )
     relationships_: Mapped[list[RelationshipORM]] = relationship(
+        back_populates="index_run", cascade="all, delete-orphan"
+    )
+    unresolved_calls: Mapped[list[UnresolvedCallORM]] = relationship(
         back_populates="index_run", cascade="all, delete-orphan"
     )
 
@@ -130,6 +143,21 @@ class RelationshipORM(Base):
     location: Mapped[str | None]
 
     index_run: Mapped[IndexRunORM] = relationship(back_populates="relationships_")
+
+
+class UnresolvedCallORM(Base):
+    """A call that could not be resolved to a known symbol -- see `domain.models.UnresolvedCall`."""
+
+    __tablename__ = "unresolved_calls"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    index_run_id: Mapped[int] = mapped_column(ForeignKey("index_runs.id"))
+    source_kind: Mapped[str]
+    source_identifier: Mapped[str] = mapped_column(index=True)
+    expression: Mapped[str]
+    location: Mapped[str]
+
+    index_run: Mapped[IndexRunORM] = relationship(back_populates="unresolved_calls")
 
 
 class AICacheORM(Base):

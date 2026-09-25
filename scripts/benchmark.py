@@ -36,7 +36,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from codebase_manual.ai.grounding import GroundingValidator, ValidationVerdict
-from codebase_manual.ai.impact import compute_impact_facts
+from codebase_manual.ai.impact import analyze_impact, build_impact_candidates, compute_impact_facts
 from codebase_manual.ai.qa import answer_question
 from codebase_manual.analyzer.registry import analyze_repository
 from codebase_manual.domain.models import EntityKind, EntityRef, RelationshipKind
@@ -48,6 +48,9 @@ from codebase_manual.query.retrieval import RetrievalResult, retrieve_relevant
 from codebase_manual.repository.scanner import RepositoryScanner
 
 FIXTURE_PROJECT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "fixture_project"
+TYPESCRIPT_FIXTURE_PROJECT = (
+    Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "typescript_project"
+)
 
 
 class StubProvider:
@@ -200,22 +203,20 @@ RELATIONSHIP_CHECKS: tuple[RelationshipCheck, ...] = (
         RelationshipKind.CALLS,
         "app.auth.service.AuthService.login_with_provider",
         "app.users.repository.UserRepository.get_or_create",
-        False,
-        "KNOWN GAP, not a harness bug: `self._user_repository.get_or_create(...)` is an "
-        "instance-attribute call and is not resolved -- call resolution levels 4-5 "
-        "(instance-attribute / type-aware inference) are still deferred. This CALLS edge "
-        "*should* exist once that lands; if this check starts failing (should_exist=False "
-        "but the edge is now present), that's progress, not a regression -- flip should_exist "
-        "to True and move this row out of 'known gaps.'",
+        True,
+        "instance-attribute call, resolved via constructor-injected-parameter type "
+        "inference: `__init__(self, user_repository: UserRepository)` assigns "
+        "`self._user_repository = user_repository`, so `self._user_repository."
+        "get_or_create(...)` resolves through domain.type_inference's attribute-type "
+        "tracking. Previously a KNOWN GAP (call resolution levels 4-5); closed.",
     ),
 )
 
-# Module-level target: TESTS edges only ever point at a module (see
-# domain.relationships._tests_relationships), so this is the entity kind
-# where impact's "affected tests" is actually populated -- a CLASS/FUNCTION
-# target for the same module currently returns an empty affected_tests
-# list even when tests clearly exercise it (see the "known limitations"
-# section of the report). That's reported as a finding, not patched here.
+# Module-level target: TESTS edges are asserted at both module and symbol
+# granularity now (see domain.relationships._tests_relationships) -- a
+# CLASS/FUNCTION target only has affected tests when a test resolves a call
+# to that specific symbol, so a module-level target remains the reliable
+# check here for this fixture's coarse-grained test style.
 IMPACT_TARGET = EntityRef(kind=EntityKind.MODULE, identifier="app.users.repository")
 IMPACT_EXPECTED_DIRECT_DEPENDENTS = frozenset(
     {"app.api.routes", "app.auth.service", "tests.test_auth_service", "tests.test_users_repository"}
@@ -223,6 +224,64 @@ IMPACT_EXPECTED_DIRECT_DEPENDENTS = frozenset(
 IMPACT_EXPECTED_AFFECTED_TESTS = frozenset(
     {"tests.test_auth_service", "tests.test_users_repository"}
 )
+
+
+# A second, distinct-language fixture for the accuracy report -- diversifying
+# the evaluation corpus beyond a single hand-crafted Python fixture (per the
+# same reasoning as `analyzer.typescript_analyzer`'s proof-of-architecture
+# framing: these checks exercise the exact same `build_relationships` this
+# module runs against Python, over facts a *different* analyzer produced).
+TYPESCRIPT_RELATIONSHIP_CHECKS: tuple[RelationshipCheck, ...] = (
+    RelationshipCheck(
+        RelationshipKind.INHERITS,
+        "src.service.AuthService",
+        "src.service.BaseService",
+        True,
+        "direct `extends` base-class evidence",
+    ),
+    RelationshipCheck(
+        RelationshipKind.CALLS,
+        "src.service.AuthService.login",
+        "src.service.AuthService.lookup",
+        True,
+        "`this.lookup()` resolved as a same-class self-reference "
+        "(domain.relationships recognizes `this` alongside Python's `self`/`cls`)",
+    ),
+    RelationshipCheck(
+        RelationshipKind.CALLS,
+        "src.service.AuthService.login",
+        "src.service.BaseService.describe",
+        True,
+        "`this.describe()` resolved onto the inherited base class method "
+        "(inheritance-aware method resolution, unmodified from the Python path)",
+    ),
+    RelationshipCheck(
+        RelationshipKind.CALLS,
+        "src.service.buildRepository",
+        "src.repository.UserRepository",
+        False,
+        "KNOWN GAP, disclosed in analyzer.typescript_analyzer's module docstring: "
+        "`new UserRepository()` is constructed from a cross-file relative import "
+        "(`./repository`), which `_resolve_import_module`'s Python-package-relative "
+        "logic does not resolve for a TypeScript-style relative path. Must surface as "
+        "an UnresolvedCall, never a fabricated relationship -- see the hallucination "
+        "section's `analyze_impact`-style cross-check for the equivalent guarantee.",
+    ),
+)
+
+
+def run_typescript_relationship_checks(snapshot: RepositorySnapshot) -> list[str]:
+    """Returns failure descriptions, empty if every check passed."""
+    existing = {(r.kind, r.source.identifier, r.target.identifier) for r in snapshot.relationships}
+    failures: list[str] = []
+    for check in TYPESCRIPT_RELATIONSHIP_CHECKS:
+        present = (check.kind, check.source, check.target) in existing
+        if present != check.should_exist:
+            failures.append(
+                f"{check.kind.value} {check.source} -> {check.target} "
+                f"(expected present={check.should_exist}, actual present={present}): {check.note}"
+            )
+    return failures
 
 
 @dataclass
@@ -302,6 +361,16 @@ def print_accuracy_report(report: AccuracyReport) -> None:
     print()
 
 
+def print_typescript_accuracy_report(snapshot: RepositorySnapshot) -> None:
+    print("=== Accuracy (tests/fixtures/typescript_project, second language) ===\n")
+    failures = run_typescript_relationship_checks(snapshot)
+    passed = len(TYPESCRIPT_RELATIONSHIP_CHECKS) - len(failures)
+    print(f"Relationship checks: {passed}/{len(TYPESCRIPT_RELATIONSHIP_CHECKS)} passed")
+    for failure in failures:
+        print(f"  UNEXPECTED: {failure}")
+    print()
+
+
 # ---------------------------------------------------------------------------
 # Hallucination resistance / confidence calibration.
 # ---------------------------------------------------------------------------
@@ -363,6 +432,45 @@ def run_hallucination_benchmark(snapshot: RepositorySnapshot) -> HallucinationRe
             "real bug in the trust boundary, not an expected benchmark finding."
         )
 
+    # `ai.impact.analyze_impact`'s free-prose `explanation` now cites candidate IDs
+    # too (previously an unmeasurable gap in the trust boundary -- see Context.md).
+    # Same honest/hallucinating shape as the retrieval scenarios above, but built
+    # from impact facts, not retrieval.
+    impact_facts = compute_impact_facts(IMPACT_TARGET, snapshot)
+    impact_candidates = build_impact_candidates(impact_facts)
+    impact_validator = GroundingValidator(impact_candidates, snapshot)
+    real_impact_ids = [c.id for c in (*impact_candidates.files, *impact_candidates.tests)][:2]
+    if real_impact_ids:
+        honest_impact = impact_validator.resolve_candidate_ids(real_impact_ids)
+        impact_label = "impact: " + IMPACT_TARGET.identifier
+        report.scenario_results.append(
+            (impact_label, "honest", honest_impact.verdict, 0, len(real_impact_ids))
+        )
+
+        invented_impact_ids = [*real_impact_ids, "FILE_999"]
+        hallucinating_impact = impact_validator.resolve_candidate_ids(invented_impact_ids)
+        report.scenario_results.append(
+            (
+                impact_label,
+                "hallucinating",
+                hallucinating_impact.verdict,
+                len(hallucinating_impact.rejected_ids),
+                len(invented_impact_ids),
+            )
+        )
+
+        impact_response = json.dumps(
+            {
+                "explanation": "Changing this module also affects an unrelated module.",
+                "cited_ids": invented_impact_ids,
+            }
+        )
+        impact_report = analyze_impact(IMPACT_TARGET, snapshot, StubProvider(impact_response))
+        assert impact_report.grounding == hallucinating_impact.verdict, (
+            "analyze_impact's grounding verdict diverged from a direct "
+            "GroundingValidator call for the same cited IDs."
+        )
+
     return report
 
 
@@ -384,12 +492,9 @@ def print_hallucination_report(report: HallucinationReport) -> None:
         "than MEDIUM/LOW': for ask/change, that question has no HIGH case to compare."
     )
     print(
-        "\n  Known unmeasured gap: `ai.impact.analyze_impact`'s `explanation` is free "
-        "prose with no candidate-ID citation mechanism (see its system prompt's "
-        "'do not invent any dependency' instruction) -- there is nothing structured "
-        "for GroundingValidator to check it against, so its unsupported-claim rate "
-        "cannot be measured the way ask/change's can. This is a real coverage gap in "
-        "the trust boundary, not a limitation of this script."
+        "\n  `ai.impact.analyze_impact`'s `explanation` now cites candidate IDs too "
+        "(the 'impact: ...' scenario above) -- previously a real coverage gap in the "
+        "trust boundary (free prose with no citation mechanism at all); closed."
     )
     print()
 
@@ -535,6 +640,7 @@ def main() -> None:
 
     if args.section in ("accuracy", "all"):
         print_accuracy_report(run_accuracy_benchmark(snapshot))
+        print_typescript_accuracy_report(_load_snapshot(TYPESCRIPT_FIXTURE_PROJECT))
     if args.section in ("hallucination", "all"):
         print_hallucination_report(run_hallucination_benchmark(snapshot))
     if args.section in ("performance", "all"):

@@ -9,6 +9,7 @@ guessed, per the "never fabricate a relationship" rule.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 
 from codebase_manual.domain.models import (
@@ -22,7 +23,18 @@ from codebase_manual.domain.models import (
     Relationship,
     RelationshipKind,
     SourceLocation,
+    UnresolvedCall,
 )
+from codebase_manual.domain.type_inference import (
+    build_attribute_types,
+    build_local_var_types,
+    iter_function_callers,
+    resolve_attribute_type,
+    resolve_method_on_class,
+)
+from codebase_manual.logging_config import get_logger
+
+_logger = get_logger("domain.relationships")
 
 
 def _module_ref(name: str) -> EntityRef:
@@ -281,20 +293,68 @@ def _resolve_call(
     expression: str,
     local_map: dict[str, str],
     index: _RepositoryIndex,
+    *,
+    attribute_types: dict[str, dict[str, str]],
+    local_var_types: dict[str, str],
+    local_maps: dict[str, dict[str, str]],
 ) -> EntityRef | None:
-    if expression.startswith(("self.", "cls.")) and owning_class is not None:
-        method_name = expression.split(".", 1)[1]
-        candidate = f"{owning_class.qualified_name}.{method_name}"
-        return _function_ref(candidate) if candidate in index.functions_by_qname else None
+    """Resolve a call expression's callee to the entity it invokes, or None if unresolvable.
 
-    root = expression.split(".", 1)[0]
-    resolved = local_map.get(root)
-    if resolved is None:
+    Levels of resolution, from most to least direct:
+      1. `self.method()` / `cls.method()` (`this.method()` in a TypeScript
+         source's facts -- the domain model doesn't distinguish which
+         analyzer produced a `PythonModule`, so the same self-reference
+         resolution serves both) -- resolved on the owning class, walking
+         resolvable base classes (inheritance-aware dispatch).
+      2. `self.attr.method()` / `cls.attr.method()` -- `attr`'s type is
+         looked up (constructor-injected dependency, direct construction,
+         dataclass-style annotation, or factory return type -- see
+         `domain.type_inference`), then the method is resolved on that type.
+      3. `Name()` -- a bare call: direct construction/factory/local function
+         call, resolved via this module's import/definition namespace.
+      4. `Name.method()` -- `Name` resolved as a locally-known class (calls
+         the method, inheritance-aware) or as a local variable of known type
+         (constructor-injected parameter, direct construction, factory
+         return, or simple name propagation from another typed variable).
+    Anything else -- a deeper attribute chain, a call through an untyped
+    parameter, a dynamically computed callee -- resolves to None: dropped,
+    never guessed.
+    """
+    parts = expression.split(".")
+
+    if parts[0] in ("self", "cls", "this") and owning_class is not None:
+        if len(parts) == 2:
+            return resolve_method_on_class(owning_class.qualified_name, parts[1], index, local_maps)
+        if len(parts) == 3:
+            target_class = resolve_attribute_type(
+                owning_class.qualified_name, parts[1], attribute_types, index, local_maps
+            )
+            if target_class is None:
+                return None
+            return resolve_method_on_class(target_class, parts[2], index, local_maps)
         return None
-    if resolved in index.functions_by_qname:
-        return _function_ref(resolved)
-    if resolved in index.classes_by_qname:
-        return _class_ref(resolved)
+
+    root = parts[0]
+    if len(parts) == 1:
+        resolved = local_map.get(root)
+        if resolved is None:
+            return None
+        if resolved in index.functions_by_qname:
+            return _function_ref(resolved)
+        if resolved in index.classes_by_qname:
+            return _class_ref(resolved)
+        return None
+
+    if len(parts) == 2:
+        method_name = parts[1]
+        resolved = local_map.get(root)
+        if resolved is not None and resolved in index.classes_by_qname:
+            return resolve_method_on_class(resolved, method_name, index, local_maps)
+        var_type = local_var_types.get(root)
+        if var_type is not None:
+            return resolve_method_on_class(var_type, method_name, index, local_maps)
+        return None
+
     return None
 
 
@@ -302,20 +362,47 @@ def _calls_relationships(
     modules: list[PythonModule],
     local_maps: dict[str, dict[str, str]],
     index: _RepositoryIndex,
-) -> list[Relationship]:
+    attribute_types: dict[str, dict[str, str]],
+    local_var_types: dict[str, dict[str, str]],
+) -> tuple[list[Relationship], list[UnresolvedCall]]:
     relationships: list[Relationship] = []
+    unresolved: list[UnresolvedCall] = []
 
     for module in modules:
         if not module.module_name:
             continue
         local_map = local_maps.get(module.module_name, {})
 
-        for function, owning_class in _function_callers(module):
-            relationships.extend(
-                _calls_for_function(function, owning_class, module, local_map, index)
-            )
+        module_relationships, module_unresolved = _calls_for_call_sites(
+            module.calls,
+            _module_ref(module.module_name),
+            None,
+            module,
+            local_map,
+            index,
+            attribute_types=attribute_types,
+            local_var_types={},
+            local_maps=local_maps,
+        )
+        relationships.extend(module_relationships)
+        unresolved.extend(module_unresolved)
 
-    return relationships
+        for function, owning_class in iter_function_callers(module):
+            function_relationships, function_unresolved = _calls_for_call_sites(
+                function.calls,
+                _function_ref(function.qualified_name),
+                owning_class,
+                module,
+                local_map,
+                index,
+                attribute_types=attribute_types,
+                local_var_types=local_var_types.get(function.qualified_name, {}),
+                local_maps=local_maps,
+            )
+            relationships.extend(function_relationships)
+            unresolved.extend(function_unresolved)
+
+    return relationships, unresolved
 
 
 def _call_site_location(call_site: CallSite) -> SourceLocation:
@@ -327,20 +414,48 @@ def _call_site_location(call_site: CallSite) -> SourceLocation:
     )
 
 
-def _calls_for_function(
-    function: FunctionSymbol,
+def _calls_for_call_sites(
+    call_sites: list[CallSite],
+    source_ref: EntityRef,
     owning_class: ClassSymbol | None,
     module: PythonModule,
     local_map: dict[str, str],
     index: _RepositoryIndex,
-) -> list[Relationship]:
+    *,
+    attribute_types: dict[str, dict[str, str]],
+    local_var_types: dict[str, str],
+    local_maps: dict[str, dict[str, str]],
+) -> tuple[list[Relationship], list[UnresolvedCall]]:
+    """Resolve every call site belonging to one scope (a function, or a module's
+    own top-level statements) into `CALLS` relationships plus `UnresolvedCall`
+    facts for whatever didn't resolve. `source_ref` is that scope's own entity --
+    a `FunctionSymbol`'s qualified name, or the module itself for module-level
+    calls.
+    """
     relationships: list[Relationship] = []
-    source_ref = _function_ref(function.qualified_name)
+    unresolved: list[UnresolvedCall] = []
     seen: set[str] = set()
 
-    for call_site in function.calls:
-        target_ref = _resolve_call(owning_class, call_site.expression, local_map, index)
-        if target_ref is None or target_ref.identifier == function.qualified_name:
+    for call_site in call_sites:
+        target_ref = _resolve_call(
+            owning_class,
+            call_site.expression,
+            local_map,
+            index,
+            attribute_types=attribute_types,
+            local_var_types=local_var_types,
+            local_maps=local_maps,
+        )
+        if target_ref is None:
+            unresolved.append(
+                UnresolvedCall(
+                    source=source_ref,
+                    expression=call_site.expression,
+                    location=_call_site_location(call_site),
+                )
+            )
+            continue
+        if target_ref.identifier == source_ref.identifier:
             continue
         if target_ref.identifier in seen:
             continue
@@ -351,30 +466,22 @@ def _calls_for_function(
                 source=source_ref,
                 target=target_ref,
                 evidence=(
-                    f"`{function.qualified_name}` calls `{call_site.expression}` at "
+                    f"`{source_ref.identifier}` calls `{call_site.expression}` at "
                     f"{module.path}:{call_site.line}"
                 ),
                 location=_call_site_location(call_site),
             )
         )
 
-    return relationships
-
-
-def _function_callers(module: PythonModule) -> list[tuple[FunctionSymbol, ClassSymbol | None]]:
-    """Every function/method in `module`, paired with its owning class (if any)."""
-    callers: list[tuple[FunctionSymbol, ClassSymbol | None]] = [
-        (function, None) for function in module.functions
-    ]
-    for klass in module.classes:
-        callers.extend((method, klass) for method in klass.methods)
-    return callers
+    return relationships, unresolved
 
 
 def _tests_relationships(
     modules: list[PythonModule],
     local_maps: dict[str, dict[str, str]],
     index: _RepositoryIndex,
+    attribute_types: dict[str, dict[str, str]],
+    local_var_types: dict[str, dict[str, str]],
 ) -> list[Relationship]:
     """TESTS is asserted only from a resolved call, not from an import alone.
 
@@ -382,6 +489,16 @@ def _tests_relationships(
     it; a test function *calling* (or constructing) something defined in
     that module is. This also covers "imports X and directly constructs X"
     (a constructor call `X(...)` is a call like any other).
+
+    Two granularities are asserted from the same resolved call: a
+    module-level edge (test module -> target module, deduplicated per
+    target module -- unchanged from before) and a symbol-level edge (test
+    function -> the specific function/class/method it resolved to,
+    deduplicated per (test function, target)). The symbol-level edge only
+    exists when the call resolution in `_resolve_call` actually reached a
+    specific function or class -- e.g. through a constructor-injected
+    fixture attribute -- so `impact <function>` can find tests that exercise
+    it directly instead of only tests of its whole module.
     """
     relationships: list[Relationship] = []
 
@@ -390,43 +507,86 @@ def _tests_relationships(
             continue
         source_ref = _module_ref(module.module_name)
         local_map = local_maps.get(module.module_name, {})
-        seen: set[str] = set()
+        seen_modules: set[str] = set()
 
-        for function, owning_class in _function_callers(module):
+        for function, owning_class in iter_function_callers(module):
+            function_local_var_types = local_var_types.get(function.qualified_name, {})
+            seen_symbols: set[str] = set()
+
             for call_site in function.calls:
-                target_ref = _resolve_call(owning_class, call_site.expression, local_map, index)
+                target_ref = _resolve_call(
+                    owning_class,
+                    call_site.expression,
+                    local_map,
+                    index,
+                    attribute_types=attribute_types,
+                    local_var_types=function_local_var_types,
+                    local_maps=local_maps,
+                )
                 if target_ref is None:
                     continue
                 target_module = index.module_owning(target_ref)
-                if (
-                    target_module is None
-                    or target_module == module.module_name
-                    or target_module in seen
-                ):
+                if target_module is None or target_module == module.module_name:
                     continue
                 target_module_obj = index.modules_by_name.get(target_module)
                 if target_module_obj is not None and _is_test_module(target_module_obj):
                     continue
-                seen.add(target_module)
-                relationships.append(
-                    Relationship(
-                        kind=RelationshipKind.TESTS,
-                        source=source_ref,
-                        target=_module_ref(target_module),
-                        evidence=(
-                            f"`{function.qualified_name}` calls `{call_site.expression}` "
-                            f"(resolved to `{target_ref.identifier}`) at "
-                            f"{module.path}:{call_site.line}"
-                        ),
-                        location=_call_site_location(call_site),
-                    )
+
+                evidence = (
+                    f"`{function.qualified_name}` calls `{call_site.expression}` "
+                    f"(resolved to `{target_ref.identifier}`) at "
+                    f"{module.path}:{call_site.line}"
                 )
+
+                if (
+                    target_ref.identifier != function.qualified_name
+                    and target_ref.identifier not in seen_symbols
+                ):
+                    seen_symbols.add(target_ref.identifier)
+                    relationships.append(
+                        Relationship(
+                            kind=RelationshipKind.TESTS,
+                            source=_function_ref(function.qualified_name),
+                            target=target_ref,
+                            evidence=evidence,
+                            location=_call_site_location(call_site),
+                        )
+                    )
+
+                if target_module not in seen_modules:
+                    seen_modules.add(target_module)
+                    relationships.append(
+                        Relationship(
+                            kind=RelationshipKind.TESTS,
+                            source=source_ref,
+                            target=_module_ref(target_module),
+                            evidence=evidence,
+                            location=_call_site_location(call_site),
+                        )
+                    )
 
     return relationships
 
 
-def build_relationships(modules: list[PythonModule]) -> list[Relationship]:
-    """Derive all deterministic relationship facts for a set of analyzed modules."""
+@dataclass
+class RelationshipBuildResult:
+    """Both outputs of one `build_relationships_with_unresolved` run.
+
+    Kept as one call rather than two separate functions re-deriving the same
+    resolution context (`_RepositoryIndex`, local name maps, attribute/local-
+    variable types) twice.
+    """
+
+    relationships: list[Relationship] = field(default_factory=list)
+    unresolved_calls: list[UnresolvedCall] = field(default_factory=list)
+
+
+def build_relationships_with_unresolved(modules: list[PythonModule]) -> RelationshipBuildResult:
+    """Derive all deterministic relationship facts, plus every call that didn't resolve.
+
+    See `build_relationships` for the relationships-only convenience wrapper
+    most callers want.
+    """
     index = _RepositoryIndex.build(modules)
 
     relationships: list[Relationship] = []
@@ -439,9 +599,43 @@ def build_relationships(modules: list[PythonModule]) -> list[Relationship]:
         for module in modules
         if module.module_name
     }
+    attribute_types = build_attribute_types(modules, index, local_maps)
+    local_var_types = build_local_var_types(modules, index, local_maps, attribute_types)
 
     relationships.extend(_inherits_relationships(modules, local_maps, index))
-    relationships.extend(_calls_relationships(modules, local_maps, index))
-    relationships.extend(_tests_relationships(modules, local_maps, index))
+    call_relationships, unresolved_calls = _calls_relationships(
+        modules, local_maps, index, attribute_types, local_var_types
+    )
+    relationships.extend(call_relationships)
+    relationships.extend(
+        _tests_relationships(modules, local_maps, index, attribute_types, local_var_types)
+    )
 
-    return relationships
+    kind_counts = Counter(rel.kind.value for rel in relationships)
+    _logger.info(
+        "build_relationships modules=%d relationships=%d kinds=%s unresolved_calls=%d",
+        len(modules),
+        len(relationships),
+        dict(kind_counts),
+        len(unresolved_calls),
+    )
+    for call in unresolved_calls:
+        owning_module = index.modules_by_name.get(index.module_owning(call.source) or "")
+        _logger.debug(
+            "unresolved call source=%s expression=%r at %s:%d",
+            call.source.identifier,
+            call.expression,
+            owning_module.path if owning_module else "?",
+            call.location.line_start,
+        )
+
+    return RelationshipBuildResult(relationships=relationships, unresolved_calls=unresolved_calls)
+
+
+def build_relationships(modules: list[PythonModule]) -> list[Relationship]:
+    """Derive all deterministic relationship facts for a set of analyzed modules.
+
+    A thin wrapper over `build_relationships_with_unresolved` for the (common)
+    case where the caller doesn't need the unresolved-call facts too.
+    """
+    return build_relationships_with_unresolved(modules).relationships

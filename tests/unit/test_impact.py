@@ -133,3 +133,58 @@ def test_analyze_impact_is_high_confidence_when_nothing_depends_on_target() -> N
 
     assert report.direct_dependents == []
     assert report.confidence.value == "high"
+
+
+def test_analyze_impact_grounds_a_valid_citation() -> None:
+    """A citation naming a candidate ID that actually appears among the target's
+    dependents/tests resolves and becomes evidence, with a VALID verdict. Candidate
+    IDs are assigned target-first, so FILE_001 is the target `pkg.a` itself and
+    FILE_002 is its direct dependent `pkg.b` (see `build_impact_candidates`)."""
+    response = json.dumps({"explanation": "Explained.", "cited_ids": ["FILE_002"]})
+    provider = _StubProvider(response)
+
+    report = analyze_impact(MOD_A, _snapshot(), provider)
+
+    assert report.grounding.value == "valid"
+    assert len(report.evidence) == 1
+    assert report.evidence[0].file_path == "pkg.b"
+
+
+def test_analyze_impact_rejects_an_invented_citation() -> None:
+    """A plausible-looking but nonexistent candidate ID is quarantined, not trusted
+    into the report -- this is the case `docs/performance.md` previously documented
+    as structurally unmeasurable (no citation mechanism existed for `explanation`)."""
+    response = json.dumps(
+        {
+            "explanation": "Changing pkg.a also affects the unrelated pkg.zzz module.",
+            "cited_ids": ["FILE_999"],
+        }
+    )
+    provider = _StubProvider(response)
+
+    report = analyze_impact(MOD_A, _snapshot(), provider)
+
+    assert report.grounding.value == "invalid"
+    assert report.evidence == []
+
+
+def test_analyze_impact_partially_grounds_a_mix_of_valid_and_invented_citations() -> None:
+    response = json.dumps({"explanation": "Explained.", "cited_ids": ["FILE_002", "FILE_999"]})
+    provider = _StubProvider(response)
+
+    report = analyze_impact(MOD_A, _snapshot(), provider)
+
+    assert report.grounding.value == "partially_valid"
+    assert [item.file_path for item in report.evidence] == ["pkg.b"]
+
+
+def test_analyze_impact_with_no_citations_is_valid_and_empty() -> None:
+    """The model simply not citing anything is VALID-and-empty, not a rejection --
+    the same distinction `ai.grounding.GroundingValidator` draws elsewhere."""
+    response = json.dumps({"explanation": "Explained without citing specific IDs."})
+    provider = _StubProvider(response)
+
+    report = analyze_impact(MOD_A, _snapshot(), provider)
+
+    assert report.grounding.value == "valid"
+    assert report.evidence == []

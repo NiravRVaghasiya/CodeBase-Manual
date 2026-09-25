@@ -10,6 +10,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from codebase_manual.domain.models import EntityRef, Relationship, RelationshipKind
+from codebase_manual.logging_config import get_logger
+
+_logger = get_logger("query.graph")
 
 # Kinds that represent "A depends on B" when followed forward from A.
 DEPENDENCY_KINDS = (RelationshipKind.IMPORTS, RelationshipKind.CALLS, RelationshipKind.INHERITS)
@@ -86,6 +89,13 @@ class RelationshipGraph:
             if depth == max_depth - 1:
                 truncated = True
 
+        if truncated:
+            _logger.info(
+                "transitive_dependents_traversal truncated ref=%s max_depth=%d collected=%d",
+                ref.identifier,
+                max_depth,
+                len(collected),
+            )
         return Traversal(entities=collected, truncated=truncated)
 
     def transitive_dependents(self, ref: EntityRef, max_depth: int = 5) -> list[EntityRef]:

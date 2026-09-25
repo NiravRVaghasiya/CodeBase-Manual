@@ -60,18 +60,21 @@ Set once in `main()`'s Typer callback, available to every command via
 
 `logging_config.configure_logging()` is called once, from `main()`'s
 callback, gated on `--verbose`/`--quiet`. Log call sites cover: index
-started/finished (counts, duration -- `cli/main.py`), AI request
-count/latency/success-or-failure (`ai/anthropic_provider.py`), and
-retrieval/grounding counts (`ai/qa.py`, `ai/change_planner.py`). Every log
-line carries paths, counts, durations, and outcomes only -- never a
-file's raw content, a `.env*` value, or an API key (see
-`docs/security.md`'s logging rule of thumb).
+started/finished (file/module/relationship/**unresolved-call** counts,
+duration -- `cli/main.py`), analysis reuse during an incremental index
+(`analyzer.registry`'s `reused`/`reanalyzed` counts), AI request
+count/latency/success-or-failure (`ai/anthropic_provider.py`),
+retrieval/grounding counts and *why* an entity was pulled in by graph
+expansion (`query/retrieval.py`, DEBUG level), and traversal truncation
+(`query/graph.py`). Every log line carries paths, counts, durations, and
+outcomes only -- never a file's raw content, a `.env*` value, or an API
+key (see `docs/security.md`'s logging rule of thumb).
 
-**Known gap:** "relationships unresolved" (as opposed to "relationships
-discovered," which is logged) isn't tracked anywhere yet -- that needs the
-still-deferred `CALL_UNKNOWN` fact representation (see
-`docs/implementation-plan-remaining-phases.md`'s deferred-items table).
-Logging that count is blocked on that, not on anything in this phase.
+"Relationships unresolved" is now tracked, not just "relationships
+discovered": `domain.models.UnresolvedCall`, logged as part of
+`domain.relationships.build_relationships_with_unresolved`'s summary line
+and surfaced in `index`'s own count (`cli.main.IndexSummary.
+unresolved_calls`) -- see `docs/architecture.md`'s evidence-graph section.
 
 ## Web API: JSON surface deliberately deferred
 
@@ -95,19 +98,22 @@ own phase with its own typed models -- not bolted onto the HTML routes.
 
 ## Framework-aware API endpoint detection
 
-`query/api_endpoints.py` recognizes two decorator shapes now:
-`<name>.<method>(path)` (unchanged) and `<name>.api_route(path,
-methods=[...])` (new -- `methods` defaults to `["GET"]` when omitted,
-matching Starlette). Each `ApiEndpoint` records which shape matched via
-`EndpointDetection`, not a guessed framework name -- FastAPI and Starlette
-share this decorator syntax, and code that merely imitates it is
-syntactically indistinguishable from either without inspecting imports.
-Naming the framework from syntax alone would be exactly the kind of
-fabrication this codebase's evidence model exists to prevent.
-
-**Still not detected:** `router.add_api_route(path, handler,
-methods=[...])` -- a call statement that registers a separately-defined
-handler, not a decorator on it. Detecting it needs a call expression's
-*arguments*, which `domain.models.CallSite` doesn't capture yet (only the
-callee expression, line, and column). This is a real analyzer gap, not a
-regex-pattern gap -- deferred until `CallSite` grows argument capture.
+`query/api_endpoints.py` recognizes three shapes: `<name>.<method>(path)`,
+`<name>.api_route(path, methods=[...])` (`methods` defaults to `["GET"]`
+when omitted, matching Starlette), and `<name>.add_api_route(path, handler,
+methods=[...])` -- a *call statement* registering a separately-defined
+handler, not a decorator on it. The third needed `CallSite` to capture a
+call expression's arguments (`domain.models.CallArgument`, added
+alongside `domain.models.UnresolvedCall`'s prerequisite work); it was
+deferred until that landed and is now built. The handler argument is
+resolved to a qualified name only when it's a bare name matching a
+function/method defined in the *same module* -- a handler imported from
+elsewhere produces an `ApiEndpoint` with `function_qualified_name=None`
+rather than a guess; the path/method registration is still real evidence
+even when the handler can't be resolved. Each `ApiEndpoint` records which
+shape matched via `EndpointDetection`, not a guessed framework name --
+FastAPI and Starlette share this decorator syntax, and code that merely
+imitates it is syntactically indistinguishable from either without
+inspecting imports. Naming the framework from syntax alone would be
+exactly the kind of fabrication this codebase's evidence model exists to
+prevent.

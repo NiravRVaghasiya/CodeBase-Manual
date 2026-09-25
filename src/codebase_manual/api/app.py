@@ -139,13 +139,13 @@ def create_app(repository_root: Path) -> FastAPI:
         return templates.TemplateResponse(
             request,
             "impact.html",
-            {"facts": None, "explanation": None, "error": None, "target": ""},
+            {"facts": None, "explanation": None, "evidence": [], "error": None, "target": ""},
         )
 
     @app.post("/impact", response_class=HTMLResponse)
     def impact_submit(request: Request, target: str = Form(...)) -> HTMLResponse:
         snapshot = _load_snapshot(repository_root)
-        facts, explanation, error = None, None, None
+        facts, explanation, evidence, error = None, None, [], None
 
         ref = find_entity_ref(target, snapshot)
         if ref is None:
@@ -157,13 +157,20 @@ def create_app(repository_root: Path) -> FastAPI:
             try:
                 report = analyze_impact(ref, snapshot, get_provider())
                 explanation = report.explanation
+                evidence = report.evidence
             except (AIProviderNotConfiguredError, AIProviderError, AISynthesisError) as exc:
                 explanation = f"AI explanation unavailable: {exc}"
 
         return templates.TemplateResponse(
             request,
             "impact.html",
-            {"facts": facts, "explanation": explanation, "error": error, "target": target},
+            {
+                "facts": facts,
+                "explanation": explanation,
+                "evidence": evidence,
+                "error": error,
+                "target": target,
+            },
         )
 
     return app

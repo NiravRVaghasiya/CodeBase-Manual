@@ -31,15 +31,28 @@ metadata. Purely filesystem facts; no source code has been parsed yet.
 ## 2. Scanner -> Analyzer -> Facts
 
 `analyzer.registry.analyze_repository` dispatches each file to a
-registered `LanguageAnalyzer` by `FileLanguage` (today, only
-`FileLanguage.PYTHON` has one -- see `docs/analyzers.md`). The Python
-analyzer (`analyzer.python_analyzer.analyze_module`) parses the file with
-`ast` and extracts structural facts -- module docstring, imports,
-functions/classes/methods (with parameters, decorators, docstrings, and
-scoped `CallSite`s), module-level variables -- into a `PythonModule`
+registered `LanguageAnalyzer` by `FileLanguage` -- `FileLanguage.PYTHON`
+and `FileLanguage.TYPESCRIPT` both have one today (see `docs/analyzers.md`
+for what the TypeScript analyzer does and doesn't extract; it exists as a
+proof that this dispatch seam is genuinely language-agnostic, not a
+breadth push). The Python analyzer (`analyzer.python_analyzer.
+analyze_module`) parses the file with `ast` and extracts structural facts
+-- module docstring, imports, functions/classes/methods (with parameters,
+decorators, docstrings, and scoped `CallSite`s, each with its unparsed
+`arguments`), module-level variables and calls -- into a `PythonModule`
 (`domain.models`). A syntax error is recorded as `PythonModule.parse_error`,
 never raised past this boundary: one unparseable file must not abort
 indexing the rest of the repository.
+
+`analyzer.registry.analyze_repository_incremental` is the same dispatch,
+plus reuse: a file whose fingerprint matches a previous index run's
+(`domain.models.file_fingerprint_matches`) returns that run's already-
+computed `PythonModule` instead of re-parsing it, as long as the previous
+run's `analyzer_version` still matches the current `PYTHON_MODULE_SCHEMA_VERSION`
+(an old fact shape is never reused silently). `cli.main index` uses this by
+default; relationship derivation is not incremental -- it always recomputes
+the full graph from whichever `PythonModule`s come back, since that's cheap
+relative to re-parsing every file (`docs/performance.md`).
 
 `analyzer.config.detect_source_roots`/`AnalysisContext` resolve a `src/`
 layout (or an explicit `[tool.codebase-manual] python-source-roots`
@@ -55,22 +68,33 @@ about *one file at a time*; nothing here knows about any other file yet.
 that looks at facts *across* files, deriving `Relationship`s
 (`CONTAINS`/`IMPORTS`/`CALLS`/`INHERITS`/`TESTS`) purely from concrete
 syntactic evidence -- a resolved import, a call expression that resolves
-to a known symbol, a base class that resolves to a known class, a test
-function's resolved call into non-test code. Ambiguous references (a call
-through an arbitrary local variable, an unresolved base, an
-instance-attribute call -- see `docs/performance.md`'s benchmark findings
-for a concrete example of the last one) are **dropped, not fabricated**.
-Every `Relationship` carries an `evidence` string and, for calls, the
-exact `SourceLocation` of the call site.
+to a known symbol (including through a handful of best-effort type-aware
+shapes -- constructor-injected attributes, direct construction, factory
+return annotations, simple local-variable propagation; see `domain.
+type_inference` and `docs/relationship-model.md`), a base class that
+resolves to a known class (walking resolvable base classes for inherited
+methods/attributes too), a test function's resolved call into non-test
+code. Ambiguous references (a call through a parameter with no usable type
+information, an unresolved/external base class, a call through a deeper or
+dynamically computed attribute chain than the recognized shapes cover) are
+**dropped, not fabricated**. Every `Relationship` carries an `evidence`
+string and, for calls, the exact `SourceLocation` of the call site.
 
-**Known gap:** a dropped reference currently leaves no trace at all --
-there is no `CALL_UNKNOWN` fact recording "a call happened here, but it
-didn't resolve." `tests/unit/test_invariants.py` checks the *drop* half
-of this ("never fabricated") but the *record it as unknown instead of
-silently discarding it* half was never built -- it would need a new fact
-type plus persistence plumbing. See `docs/cli.md`'s framework-detection
-section for the one other feature blocked on the same underlying
-`CallSite`-has-no-arguments limitation.
+A dropped reference is not left untraced: `domain.models.UnresolvedCall`
+records it explicitly (`source`, the raw `expression`, and its
+`SourceLocation`) rather than silently discarding it -- built from the same
+`CallSite` facts, produced alongside `Relationship`s by `domain.
+relationships.build_relationships_with_unresolved` (`build_relationships`
+is a thin wrapper over it for callers that don't need the unresolved list),
+and persisted the same way (`persistence.orm.UnresolvedCallORM`,
+`RepositorySnapshot.unresolved_calls`). `tests/unit/test_invariants.py`
+checks both halves now: the *drop* half ("never fabricated") and that the
+generator's dangling references actually produce `UnresolvedCall` facts on
+realistic generated code, not just hand-crafted unit tests. `cli.main
+index`'s `--json` summary and its plain-text output both report an
+`unresolved_calls` count. This is deliberately not itself an AI-facing
+evidence type -- see `docs/evidence-model.md`'s `UNKNOWN` strength, which
+this is a concrete instance of.
 
 `domain.evidence.evidence_from_relationship` wraps a `Relationship` into a
 structured `Evidence` record with a deterministically assigned

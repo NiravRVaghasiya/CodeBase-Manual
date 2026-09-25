@@ -30,8 +30,9 @@ from codebase_manual.domain.models import (
     PythonModule,
     Relationship,
     RelationshipKind,
+    UnresolvedCall,
 )
-from codebase_manual.domain.relationships import build_relationships
+from codebase_manual.domain.relationships import build_relationships_with_unresolved
 from codebase_manual.persistence.snapshot import RepositorySnapshot
 from codebase_manual.query.candidates import build_candidate_set
 from codebase_manual.query.graph import RelationshipGraph
@@ -59,6 +60,8 @@ def _generate_repo(root: Path, rng: random.Random, module_count: int) -> None:
             f'"""Module {i}."""',
             "",
             *import_lines,
+            "",
+            f"{call_target}(0)",  # a module-level call, not inside any function
             "",
             "",
             f"def helper_{i}(x):",
@@ -104,10 +107,13 @@ def _real_entities(modules: list[PythonModule]) -> set[EntityRef]:
     return entities
 
 
+_GeneratedRepo = tuple[list[PythonModule], list[Relationship], list[UnresolvedCall], set[EntityRef]]
+
+
 @pytest.fixture(scope="session", params=[(seed, size) for seed in _SEEDS for size in _SIZES])
 def generated_repo(
     request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
-) -> tuple[list[PythonModule], list[Relationship], set[EntityRef]]:
+) -> _GeneratedRepo:
     """Session-scoped: the same (seed, size) repo is reused across every test
     function below rather than re-generated/re-analyzed per test."""
     seed, size = request.param
@@ -119,14 +125,14 @@ def generated_repo(
     scan_result = scanner.scan()
     modules = analyze_repository(scanner.root, scan_result)
     assert all(m.parse_error is None for m in modules), "generator produced invalid Python"
-    relationships = build_relationships(modules)
-    return modules, relationships, _real_entities(modules)
+    result = build_relationships_with_unresolved(modules)
+    return modules, result.relationships, result.unresolved_calls, _real_entities(modules)
 
 
 def test_every_relationship_endpoint_resolves_to_a_real_entity(
-    generated_repo: tuple[list[PythonModule], list[Relationship], set[EntityRef]],
+    generated_repo: _GeneratedRepo,
 ) -> None:
-    _modules, relationships, real_entities = generated_repo
+    _modules, relationships, _unresolved_calls, real_entities = generated_repo
     assert relationships, "generator should always produce at least one relationship"
 
     for rel in relationships:
@@ -134,47 +140,87 @@ def test_every_relationship_endpoint_resolves_to_a_real_entity(
         assert rel.target in real_entities, f"dangling relationship target: {rel}"
 
 
-def test_every_tests_target_is_a_real_module(
-    generated_repo: tuple[list[PythonModule], list[Relationship], set[EntityRef]],
+def test_every_tests_relationship_targets_a_real_entity(
+    generated_repo: _GeneratedRepo,
 ) -> None:
-    _modules, relationships, real_entities = generated_repo
+    """TESTS is asserted at two granularities from the same resolved call: a
+    module-level edge (MODULE source -> MODULE target) and a symbol-level
+    edge (FUNCTION source -> the specific FUNCTION/CLASS resolved). Neither
+    granularity may reference an entity that wasn't actually derived.
+    """
+    _modules, relationships, _unresolved_calls, real_entities = generated_repo
 
     for rel in relationships:
         if rel.kind is not RelationshipKind.TESTS:
             continue
-        assert rel.target.kind is EntityKind.MODULE
+        if rel.source.kind is EntityKind.MODULE:
+            assert rel.target.kind is EntityKind.MODULE
+        else:
+            assert rel.source.kind is EntityKind.FUNCTION
+            assert rel.target.kind in (EntityKind.FUNCTION, EntityKind.CLASS)
+        assert rel.source in real_entities
         assert rel.target in real_entities
 
 
-def test_every_calls_source_symbol_is_a_real_function(
-    generated_repo: tuple[list[PythonModule], list[Relationship], set[EntityRef]],
+def test_every_calls_source_symbol_is_a_real_function_or_module(
+    generated_repo: _GeneratedRepo,
 ) -> None:
-    _modules, relationships, real_entities = generated_repo
+    """A `CALLS` edge's source is almost always a function/method, but a call written
+    directly at module scope (not inside any function) sources from the module itself
+    -- see `domain.relationships._calls_relationships`'s module-level pass."""
+    _modules, relationships, _unresolved_calls, real_entities = generated_repo
 
     for rel in relationships:
         if rel.kind is not RelationshipKind.CALLS:
             continue
-        assert rel.source.kind is EntityKind.FUNCTION
+        assert rel.source.kind in (EntityKind.FUNCTION, EntityKind.MODULE)
         assert rel.source in real_entities
 
 
 def test_dangling_calls_and_bases_are_dropped_not_fabricated(
-    generated_repo: tuple[list[PythonModule], list[Relationship], set[EntityRef]],
+    generated_repo: _GeneratedRepo,
 ) -> None:
     """The generator always emits at least one `no_such_helper`/`NoSuchBase`
     reference; this asserts none of them ever became a relationship target --
     the resolver dropped them, per `domain.relationships`'s "never fabricate" rule.
     """
-    _modules, relationships, _real_entities = generated_repo
+    _modules, relationships, _unresolved_calls, _real_entities = generated_repo
 
     assert all("NoSuchBase" not in rel.target.identifier for rel in relationships)
     assert all("no_such_helper" not in rel.target.identifier for rel in relationships)
 
 
-def test_graph_traversal_never_yields_an_entity_outside_the_snapshot(
-    generated_repo: tuple[list[PythonModule], list[Relationship], set[EntityRef]],
+def test_every_unresolved_call_source_is_a_real_function_or_module(
+    generated_repo: _GeneratedRepo,
 ) -> None:
-    _modules, relationships, real_entities = generated_repo
+    """Every `UnresolvedCall` is recorded, never silently discarded past the
+    point of derivation -- and its `source` (the containing function/method,
+    or the module itself for a module-level call) must be a real entity, the
+    same bar a `Relationship` endpoint is held to."""
+    _modules, _relationships, unresolved_calls, real_entities = generated_repo
+
+    for call in unresolved_calls:
+        assert call.source.kind in (EntityKind.FUNCTION, EntityKind.MODULE)
+        assert call.source in real_entities
+
+
+def test_unresolved_calls_are_produced_on_realistic_generated_code(
+    generated_repo: _GeneratedRepo,
+) -> None:
+    """The generator's `no_such_helper`/`NoSuchBase`-style dangling references (and,
+    per the module-level statement `_generate_repo` now adds, dangling module-level
+    calls too) should yield at least one `UnresolvedCall` per generated repository --
+    confirming the mechanism actually fires on realistic generated code, not only
+    the hand-crafted examples in `test_relationships.py`."""
+    _modules, _relationships, unresolved_calls, _real_entities = generated_repo
+
+    assert unresolved_calls, "generator's dangling references should yield unresolved calls"
+
+
+def test_graph_traversal_never_yields_an_entity_outside_the_snapshot(
+    generated_repo: _GeneratedRepo,
+) -> None:
+    _modules, relationships, _unresolved_calls, real_entities = generated_repo
     graph = RelationshipGraph(relationships)
 
     for entity in real_entities:
@@ -188,9 +234,9 @@ def test_graph_traversal_never_yields_an_entity_outside_the_snapshot(
 
 
 def test_every_ai_referenced_candidate_id_resolves_or_is_quarantined(
-    generated_repo: tuple[list[PythonModule], list[Relationship], set[EntityRef]],
+    generated_repo: _GeneratedRepo,
 ) -> None:
-    modules, relationships, real_entities = generated_repo
+    modules, relationships, _unresolved_calls, real_entities = generated_repo
 
     snapshot = RepositorySnapshot(
         repository_identity="invariant-test",

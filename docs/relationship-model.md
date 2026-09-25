@@ -44,10 +44,73 @@ one are not tracked at all -- absence, not misattribution.
 ## Call sites
 
 Every call recorded on a `FunctionSymbol.calls` entry is a `CallSite`:
-`expression`, `line`, `column`, `containing_symbol_id`. The `CALLS`
-relationship's `location` points at the call site itself (the `line`/
-`column` of the call expression), not the containing function's
-definition line.
+`expression`, `line`, `column`, `containing_symbol_id`, and `arguments`
+(`domain.models.CallArgument` -- each argument's unparsed text and, for a
+keyword argument, its parameter name). The `CALLS` relationship's
+`location` points at the call site itself (the `line`/`column` of the call
+expression), not the containing function's definition line. Argument
+capture exists for consumers that need to resolve an argument to a known
+symbol themselves -- `query.api_endpoints`'s `add_api_route(path, handler,
+methods=[...])` detection is the one that does today; `domain.relationships`
+does not resolve arguments as part of `CALLS` derivation.
+
+`PythonModule.calls` (module scope, not inside any function) is extracted
+the same way, using the same `_ScopedCallVisitor` over `tree.body` --
+`containing_symbol_id` is the module's own name. This makes a call written
+directly at module level (`router.add_api_route(...)`, a module-level
+`setup()` call) a real fact instead of invisible to everything downstream;
+`domain.relationships._calls_relationships` resolves these the same way it
+resolves function-scoped calls, producing a `CALLS` edge sourced from the
+module itself (`EntityKind.MODULE`) when one resolves.
+
+## Type-aware call resolution (`domain.type_inference`)
+
+`_resolve_call` handles more than a bare name or a same-class `self.method()`
+call. Four levels, most to least direct:
+
+1. `self.method()` / `cls.method()` (or `this.method()` -- `_resolve_call`
+   recognizes `this` as a self-reference too, which is what lets
+   `analyzer.typescript_analyzer`'s facts resolve through this exact same
+   function with no TypeScript-specific branch; see `docs/analyzers.md`) --
+   resolved on the owning class, walking resolvable base classes (so a
+   method defined only on a base class still resolves from a subclass
+   method body).
+2. `self.attr.method()` -- `attr`'s type is looked up first, then the
+   method is resolved on that type. The attribute's type comes from
+   whichever of these a class's methods/annotations establish (see
+   `domain.type_inference.build_attribute_types`): a constructor-injected
+   parameter assigned straight to the attribute (`self.repo = repository`
+   where `repository: UserRepository`), a direct construction
+   (`self.repo = UserRepository()`), a dataclass/pydantic-style
+   class-level annotation (`repo: UserRepository`, no `__init__` needed),
+   or a factory call with a resolvable return annotation. Attribute
+   lookup walks resolvable base classes too, so an attribute set only in
+   a base class's `__init__` still resolves from a subclass method.
+3. `Name()` -- a bare call, resolved via the module's own import/definition
+   namespace (unchanged from before).
+4. `Name.method()` -- `Name` resolved as a locally-known class (inheritance-
+   aware method resolution, not just a class reference) or as a local
+   variable of known type (`domain.type_inference.build_local_var_types`):
+   a typed parameter, a direct construction, a factory return, or simple
+   propagation from another already-typed name (`x = repo; x.find()`). A
+   variable reassigned to two different (or one unresolvable) type anywhere
+   in the function is treated as ambiguous and dropped entirely, rather
+   than resolved to whichever assignment the pass happened to see last.
+
+This is deliberately not a type checker -- it resolves only these concrete
+shapes, all derived from `Assignment` facts the analyzer extracts alongside
+`CallSite`s (`domain.models.Assignment`/`AssignedValueKind`; see
+`docs/analyzers.md`). A shape it doesn't recognize (a call through an
+untyped parameter, a dynamic/computed callee, a classmethod factory like
+`Class.create()`, `self.factory()` where `factory` is itself a method)
+resolves to `None`. Dropped from the relationship graph -- but not
+untraced: `domain.relationships.build_relationships_with_unresolved`
+records a `domain.models.UnresolvedCall` for it (see "CALL_UNKNOWN" in
+`docs/architecture.md`), so "dropped" means "not fabricated into a
+relationship," not "silently discarded." See `docs/performance.md` for
+the concrete case type-aware resolution closed:
+`self._user_repository.get_or_create(...)` now resolves to
+`UserRepository.get_or_create`.
 
 ## TESTS relationship
 
@@ -59,11 +122,27 @@ resolution as `CALLS` (`domain.relationships._resolve_call`), so `TESTS`
 now carries `EvidenceStrength.RESOLVED`, not `INFERRED` (see
 `docs/evidence-model.md`).
 
-Known limitation: pytest fixture-based usage (a fixture injected as a test
-function parameter, then used without ever being imported/constructed by
-name) is not yet detected -- this requires fixture-resolution support that
-hasn't been built yet, so such tests will not produce a `TESTS` edge even
-though they may genuinely exercise the target module.
+**Two granularities are asserted from the same resolved call**: a
+module-level edge (test module -> target module, as before) and a
+symbol-level edge (the specific test function -> the specific function or
+class it resolved to, via `EntityKind.FUNCTION` source). The symbol-level
+edge only exists when resolution actually reached a specific symbol -- e.g.
+a test function whose fixture parameter is annotated with the class under
+test (`def test_x(service: Service): service.do_work()`), or a constructor-
+injected attribute the type-aware resolution above can follow. This makes
+`impact <function>`/`impact <class>` find tests that exercise that specific
+symbol directly, not only tests of its whole module -- but it is still
+bound by the same "explicit evidence only" rule: a test living in the same
+module as a function, with no resolved call reaching that function
+specifically, gets the module-level edge only, never a fabricated
+symbol-level one.
+
+Known limitation: pytest fixture-based usage where the fixture itself is a
+`@pytest.fixture`-decorated *factory function* (rather than a directly
+annotated parameter) is not resolved -- that would need the fixture
+function's own return type inferred and threaded through pytest's
+dependency-injection mechanism, which is a separate, larger piece of work
+this type inference does not attempt.
 
 ## Impact traversal truncation
 

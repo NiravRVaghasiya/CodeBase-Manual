@@ -68,8 +68,7 @@ def _module_summary_line(
             cached = get_cached_summary(cache, cache_key)
             if cached is not None:
                 return (
-                    f"AI summary ({cached.confidence.value} confidence, cached): "
-                    f"{cached.purpose}"
+                    f"AI summary ({cached.confidence.value} confidence, cached): {cached.purpose}"
                 )
 
     try:
@@ -127,10 +126,12 @@ def _apis_section(snapshot: RepositorySnapshot) -> str:
     else:
         for endpoint in sorted(endpoints, key=lambda e: (e.file_path, e.http_method)):
             path = endpoint.path or "(dynamic path)"
-            lines.append(
-                f"- `{endpoint.http_method} {path}` -> "
-                f"`{endpoint.function_qualified_name}` ({endpoint.file_path})"
+            handler = (
+                f"`{endpoint.function_qualified_name}`"
+                if endpoint.function_qualified_name
+                else "(handler unresolved)"
             )
+            lines.append(f"- `{endpoint.http_method} {path}` -> {handler} ({endpoint.file_path})")
     return "\n".join(lines)
 
 

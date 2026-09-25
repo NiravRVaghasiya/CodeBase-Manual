@@ -26,6 +26,8 @@ from codebase_manual.domain.models import (
 
 _LANGUAGE_BY_EXTENSION: dict[str, FileLanguage] = {
     ".py": FileLanguage.PYTHON,
+    ".ts": FileLanguage.TYPESCRIPT,
+    ".tsx": FileLanguage.TYPESCRIPT,
     ".toml": FileLanguage.TOML,
     ".yaml": FileLanguage.YAML,
     ".yml": FileLanguage.YAML,

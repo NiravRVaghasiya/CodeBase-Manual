@@ -78,12 +78,54 @@ not a renaming of it.
 ## AI summary caching
 
 `ai.summary_cache` keys a cached `FileSummary` on `content_hash` +
-`SUMMARY_PROMPT_VERSION` + `provider.model_identifier` + `ANALYSIS_VERSION`.
-`ai.manual.generate_manual` accepts an optional `cache` (anything
-implementing `get_cached_value`/`set_cached_value` -- `IndexStore` does,
-backed by the generic `ai_cache` table) and reuses a summary instead of
-re-requesting one on every `manual` invocation, as long as the file's
-content hash, the summarizer's prompt version, the model, and the
-analyzer's output version are all unchanged. A file with no full content
-hash (`METADATA_ONLY`) is never cached -- there's nothing stable to key it
-on, so it degrades to "always regenerate," never to "silently invalidated."
+`SUMMARY_PROMPT_VERSION` + `provider.model_identifier` +
+`domain.models.PYTHON_MODULE_SCHEMA_VERSION`. `ai.manual.generate_manual`
+accepts an optional `cache` (anything implementing `get_cached_value`/
+`set_cached_value` -- `IndexStore` does, backed by the generic `ai_cache`
+table) and reuses a summary instead of re-requesting one on every `manual`
+invocation, as long as the file's content hash, the summarizer's prompt
+version, the model, and the analyzer's output version are all unchanged. A
+file with no full content hash (`METADATA_ONLY`) is never cached --
+there's nothing stable to key it on, so it degrades to "always
+regenerate," never to "silently invalidated."
+
+## Incremental analysis
+
+`cli.main index` no longer re-parses every file on every run.
+`analyzer.registry.analyze_repository_incremental` fetches the previous
+index run for the working copy being indexed (`IndexStore.latest_snapshot`)
+before analyzing, and for each file whose fingerprint matches its entry in
+that previous run (`domain.models.file_fingerprint_matches` -- the same
+check `query.drift.detect_index_drift` uses for `check`), reuses the
+previous run's `PythonModule` instead of calling the analyzer at all. A
+new or changed file is still analyzed fresh.
+
+**This is not incremental relationship derivation.** `domain.relationships.
+build_relationships_with_unresolved` always recomputes the *entire*
+relationship graph from whichever `PythonModule`s come back (reused or
+fresh) -- there is no partial graph diff. This is a deliberate scope
+choice, not an oversight: relationship/graph-build time is small relative
+to analysis time at every measured repository size (`docs/performance.md`),
+so reusing analysis is where the real win is, and recomputing the whole
+graph avoids the correctness risk a partial diff would introduce (a stale
+edge surviving because nothing noticed its inputs changed).
+
+**Cache invalidation across analyzer versions.** Every index run is
+stamped with `domain.models.PYTHON_MODULE_SCHEMA_VERSION` at write time
+(`persistence.orm.IndexRunORM.analyzer_version`). If a previous run's
+stamp doesn't match the version running now, incremental reuse is disabled
+for the *entire* run (not per-file) -- an old fact shape is never reused
+just because its file happens to look unchanged; bump this constant
+whenever `PythonModule`'s shape changes in a way that would make an old
+instance unsafe to reuse silently (the same rule `ai.summary_cache` already
+followed for its own cache keys, now sharing this one constant instead of
+maintaining a second copy that could drift out of sync). Measured on
+`tests/fixtures/fixture_project` (21 files): a fully-unchanged re-index
+reuses all 21 modules (0 re-analyzed); a one-file edit reuses 20 and
+re-analyzes 1, producing byte-identical relationships to a full re-index
+when nothing semantically changed.
+
+**No column-migration tooling**, same as every other schema addition in
+this project (`analyzer_version`, `unresolved_calls` -- see the persistence
+schema's module docstring): an existing local SQLite index created before
+this column existed needs re-indexing, not an in-place upgrade.

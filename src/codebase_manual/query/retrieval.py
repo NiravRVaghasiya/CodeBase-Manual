@@ -34,8 +34,11 @@ from codebase_manual.domain.models import (
     PythonModule,
     RelationshipKind,
 )
+from codebase_manual.logging_config import get_logger
 from codebase_manual.persistence.snapshot import RepositorySnapshot
 from codebase_manual.query.graph import RelationshipGraph
+
+_logger = get_logger("query.retrieval")
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _STOPWORDS = {
@@ -301,21 +304,24 @@ def _add_relationship_signal(
 
     module = index.file_for_ref(ref)
     if module is not None:
-        if module.path in files:
-            files[module.path].signals.append(signal)
-        else:
+        is_new = module.path not in files
+        if is_new:
             files[module.path] = RetrievedFile(module=module, signals=[signal])
+            _logger.debug("retrieval expansion added file=%s reason=%r", module.path, detail)
+        else:
+            files[module.path].signals.append(signal)
         return
 
     resolved = index.symbol_for_ref(ref)
     if resolved is not None:
         kind, module_path = resolved
-        if ref.identifier in symbols:
-            symbols[ref.identifier].signals.append(signal)
-        else:
+        if ref.identifier not in symbols:
             symbols[ref.identifier] = RetrievedSymbol(
                 identifier=ref.identifier, kind=kind, module_path=module_path, signals=[signal]
             )
+            _logger.debug("retrieval expansion added symbol=%s reason=%r", ref.identifier, detail)
+        else:
+            symbols[ref.identifier].signals.append(signal)
 
 
 def _expand_via_relationships(
@@ -455,8 +461,10 @@ def retrieve_relevant(
                     )
 
     if not files and not symbols:
+        _logger.info("retrieve_relevant query=%r no lexical match", query)
         return RetrievalResult(query_terms=query_terms)
 
+    lexical_files, lexical_symbols = len(files), len(symbols)
     seed_file_paths = set(files)
     index = _SymbolIndex.build(snapshot)
     graph = RelationshipGraph(snapshot.relationships)
@@ -470,6 +478,19 @@ def retrieve_relevant(
     seed_function_ids = [s.identifier for s in ranked_symbols if s.kind == "function"]
     chains = _relationship_chains(
         seed_function_ids, graph, max_depth=chain_depth, max_chains=max_chains
+    )
+
+    _logger.info(
+        "retrieve_relevant query=%r lexical_files=%d lexical_symbols=%d "
+        "expanded_files=%d expanded_symbols=%d ranked_files=%d ranked_symbols=%d chains=%d",
+        query,
+        lexical_files,
+        lexical_symbols,
+        len(files) - lexical_files,
+        len(symbols) - lexical_symbols,
+        len(ranked_files),
+        len(ranked_symbols),
+        len(chains),
     )
 
     return RetrievalResult(

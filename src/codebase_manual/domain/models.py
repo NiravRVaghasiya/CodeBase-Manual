@@ -12,6 +12,13 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+# Bump when `PythonModule`'s shape changes in a way that would make an old,
+# persisted instance unsafe to reuse without re-analysis -- consumed by
+# `analyzer.registry`'s incremental reuse decision and `ai.summary_cache`'s
+# cache keys, both of which need "is this fact shape still what the current
+# analyzer would produce" answered the same way, from one place.
+PYTHON_MODULE_SCHEMA_VERSION = "1"
+
 
 class SourceLocation(BaseModel):
     """A location within a source file, using 1-indexed line numbers."""
@@ -60,6 +67,58 @@ class Variable(BaseModel):
     location: SourceLocation
 
 
+class AssignedValueKind(StrEnum):
+    """The shape of an assignment's right-hand side, as far as type inference can use it.
+
+    CALL      -- `x = Foo(...)` / `x = get_repo(...)`: `value_expression` is the
+                 unparsed callee, resolved as a construction or factory call.
+    NAME      -- `x = other_name`: `value_expression` is the bare name, resolved
+                 by propagating whatever type (if any) `other_name` already has.
+    ATTRIBUTE -- `x = self.other` / `x = cls.other`: `value_expression` is the
+                 unparsed dotted text, resolved via the owning class's own
+                 attribute types.
+    """
+
+    CALL = "call"
+    NAME = "name"
+    ATTRIBUTE = "attribute"
+
+
+class Assignment(BaseModel):
+    """A single `target = value` assignment found directly in a function's own scope.
+
+    Only assignments whose target is a plain local name or a `self.`/`cls.`
+    attribute, and whose value is a call, a bare name, or a dotted attribute
+    access, are recorded -- anything else (tuple unpacking, subscripts,
+    literals, binary expressions) carries no usable type information and is
+    not recorded at all. See `domain.type_inference` for how these are turned
+    into best-effort attribute/local-variable types.
+    """
+
+    model_config = {"frozen": True}
+
+    target: str
+    is_attribute: bool
+    value_kind: AssignedValueKind
+    value_expression: str
+    line: int
+
+
+class CallArgument(BaseModel):
+    """One argument of a call expression, unparsed.
+
+    `keyword` is the parameter name for `f(x=1)`, `None` for a positional
+    argument (including a `*args`-unpacked one -- `value` already contains
+    the leading `*` from `ast.unparse`) or a `**kwargs`-style unpacking
+    (`value` contains the leading `**`).
+    """
+
+    model_config = {"frozen": True}
+
+    value: str
+    keyword: str | None = None
+
+
 class CallSite(BaseModel):
     """A single call expression found directly in a function's own scope.
 
@@ -67,7 +126,10 @@ class CallSite(BaseModel):
     within this function's body -- those belong to that nested scope, not
     this one. `expression` is the raw, unresolved callee text (e.g.
     "self.foo", "Bar"); resolution against known symbols happens in
-    `domain.relationships`.
+    `domain.relationships`. `arguments` are captured unparsed, unresolved --
+    consumers that need to resolve an argument to a known symbol (e.g.
+    `query.api_endpoints`'s `add_api_route` handler) do that resolution
+    themselves.
     """
 
     model_config = {"frozen": True}
@@ -76,6 +138,7 @@ class CallSite(BaseModel):
     line: int
     column: int | None = None
     containing_symbol_id: str
+    arguments: list[CallArgument] = Field(default_factory=list)
 
 
 class FunctionSymbol(BaseModel):
@@ -89,6 +152,7 @@ class FunctionSymbol(BaseModel):
     docstring: str | None = None
     location: SourceLocation
     calls: list[CallSite] = Field(default_factory=list)
+    assignments: list[Assignment] = Field(default_factory=list)
 
 
 class ClassSymbol(BaseModel):
@@ -103,7 +167,13 @@ class ClassSymbol(BaseModel):
 
 
 class PythonModule(BaseModel):
-    """Structural facts extracted from a single Python source file."""
+    """Structural facts extracted from a single source file.
+
+    Despite the name, nothing here requires the source to actually be
+    Python -- it is the fact *shape* every `LanguageAnalyzer` must produce
+    (see `analyzer.registry.LanguageAnalyzer`, `docs/analyzers.md`).
+    `analyzer.typescript_analyzer` produces the same shape for TypeScript.
+    """
 
     path: str
     module_name: str | None = None
@@ -112,11 +182,13 @@ class PythonModule(BaseModel):
     functions: list[FunctionSymbol] = Field(default_factory=list)
     classes: list[ClassSymbol] = Field(default_factory=list)
     variables: list[Variable] = Field(default_factory=list)
+    calls: list[CallSite] = Field(default_factory=list)
     parse_error: str | None = None
 
 
 class FileLanguage(StrEnum):
     PYTHON = "python"
+    TYPESCRIPT = "typescript"
     TOML = "toml"
     YAML = "yaml"
     JSON = "json"
@@ -150,6 +222,32 @@ class FileRecord(BaseModel):
     content_hash: str | None = None
     hash_strategy: FileHashStrategy = FileHashStrategy.METADATA_ONLY
     mtime: float | None = None
+
+
+def file_fingerprint_matches(previous: FileRecord, current: FileRecord) -> bool:
+    """Whether `current` is the same file `previous` was, by content hash or,
+    for a file with no full hash (binary, oversized, `.env*`), by size/mtime.
+
+    The single source of truth for "this file hasn't changed" -- used by
+    `query.drift.detect_index_drift` (has it changed since the last index)
+    and `analyzer.registry.analyze_repository_incremental` (can its prior
+    analysis be reused instead of re-parsed). Lives in `domain.models`,
+    not either of those modules, so neither has to import the other for it.
+    """
+    if (
+        previous.hash_strategy is FileHashStrategy.FULL_HASH
+        and current.hash_strategy is FileHashStrategy.FULL_HASH
+        and previous.content_hash is not None
+        and current.content_hash is not None
+    ):
+        return previous.content_hash == current.content_hash
+
+    return (
+        previous.mtime is not None
+        and current.mtime is not None
+        and previous.size_bytes == current.size_bytes
+        and previous.mtime == current.mtime
+    )
 
 
 class DirectoryRecord(BaseModel):
@@ -204,6 +302,25 @@ class EntityRef(BaseModel):
 
     kind: EntityKind
     identifier: str
+
+
+class UnresolvedCall(BaseModel):
+    """A call expression that was found but could not be resolved to a known symbol.
+
+    Recorded explicitly rather than silently dropped -- its presence *is*
+    the evidence of "unknown" (see `domain.evidence.EvidenceStrength.UNKNOWN`).
+    This is deliberately not a `Relationship`: a `Relationship`'s `target`
+    must be a real, already-resolved entity, and an unresolved call has none
+    -- forcing it into the `Relationship` shape would mean either fabricating
+    a target or silently dropping the fact, both of which this exists to
+    avoid. Produced by `domain.relationships.build_relationships_with_unresolved`.
+    """
+
+    model_config = {"frozen": True}
+
+    source: EntityRef
+    expression: str
+    location: SourceLocation
 
 
 class RelationshipKind(StrEnum):

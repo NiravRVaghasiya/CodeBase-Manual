@@ -14,14 +14,11 @@ from __future__ import annotations
 from typing import Protocol
 
 from codebase_manual.ai.models import FileSummary
+from codebase_manual.domain.models import PYTHON_MODULE_SCHEMA_VERSION
 
 # Bump when `ai.summarizer`'s prompt or expected JSON schema changes in a
 # way that could change what a summary means.
 SUMMARY_PROMPT_VERSION = "1"
-
-# Bump when `PythonModule`'s shape changes in a way that could change what
-# facts a summary was grounded in.
-ANALYSIS_VERSION = "1"
 
 
 class SummaryCacheStore(Protocol):
@@ -47,7 +44,7 @@ def summary_cache_key(*, content_hash: str | None, model_identifier: str) -> str
         return None
     return (
         f"file_summary:{content_hash}:{SUMMARY_PROMPT_VERSION}:"
-        f"{model_identifier}:{ANALYSIS_VERSION}"
+        f"{model_identifier}:{PYTHON_MODULE_SCHEMA_VERSION}"
     )
 
 

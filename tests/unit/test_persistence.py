@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from codebase_manual.domain.models import (
+    PYTHON_MODULE_SCHEMA_VERSION,
     EntityKind,
     EntityRef,
     FileLanguage,
@@ -21,6 +22,7 @@ from codebase_manual.domain.models import (
     RepositoryRecord,
     ScanResult,
     SourceLocation,
+    UnresolvedCall,
 )
 from codebase_manual.persistence.database import create_database_engine
 from codebase_manual.persistence.orm import IndexRunORM, RepositoryORM, WorkingCopyORM
@@ -83,13 +85,23 @@ def _relationship() -> Relationship:
     )
 
 
+def _unresolved_call() -> UnresolvedCall:
+    return UnresolvedCall(
+        source=EntityRef(kind=EntityKind.FUNCTION, identifier="app.main"),
+        expression="service.run",
+        location=SourceLocation(line_start=2, line_end=2),
+    )
+
+
 def test_save_and_load_round_trip(tmp_path: Path) -> None:
     store = IndexStore(_engine(tmp_path))
     scan_result = _scan_result(
         str(tmp_path), commit_sha="a" * 40, indexed_at=datetime(2026, 1, 1, tzinfo=UTC)
     )
 
-    run_id = store.save(scan_result, [_module()], [_relationship()])
+    run_id = store.save(
+        scan_result, [_module()], [_relationship()], unresolved_calls=[_unresolved_call()]
+    )
     assert run_id > 0
 
     snapshot = store.latest_snapshot(repository_identity(scan_result))
@@ -99,6 +111,26 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
     assert snapshot.modules[0].module_name == "app"
     assert snapshot.modules[0].functions[0].qualified_name == "app.main"
     assert snapshot.relationships[0].kind is RelationshipKind.CONTAINS
+    assert len(snapshot.unresolved_calls) == 1
+    assert snapshot.unresolved_calls[0].source.identifier == "app.main"
+    assert snapshot.unresolved_calls[0].expression == "service.run"
+    assert snapshot.unresolved_calls[0].location.line_start == 2
+    assert snapshot.analyzer_version == PYTHON_MODULE_SCHEMA_VERSION
+
+
+def test_save_without_unresolved_calls_defaults_to_empty(tmp_path: Path) -> None:
+    """`unresolved_calls` is optional -- existing callers that don't pass it (or
+    a snapshot from before this fact existed) get an empty list, not an error."""
+    store = IndexStore(_engine(tmp_path))
+    scan_result = _scan_result(
+        str(tmp_path), commit_sha="c" * 40, indexed_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+
+    store.save(scan_result, [_module()], [_relationship()])
+
+    snapshot = store.latest_snapshot(repository_identity(scan_result))
+    assert snapshot is not None
+    assert snapshot.unresolved_calls == []
 
 
 def test_latest_snapshot_returns_none_for_unknown_repository(tmp_path: Path) -> None:

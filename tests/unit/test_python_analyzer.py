@@ -5,7 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from codebase_manual.analyzer.python_analyzer import analyze_module, infer_module_name
-from codebase_manual.domain.models import ParameterKind, PythonModule
+from codebase_manual.domain.models import (
+    AssignedValueKind,
+    Assignment,
+    CallArgument,
+    ParameterKind,
+    PythonModule,
+)
 
 
 def _analyze(tmp_path: Path, source: str, *, filename: str = "module.py") -> PythonModule:
@@ -243,3 +249,120 @@ def test_analyze_module_extracts_module_level_variables(tmp_path: Path) -> None:
     assert by_name["MAX_RETRIES"].is_constant is True
     assert by_name["MAX_RETRIES"].annotation == "int"
     assert by_name["name"].is_constant is False
+
+
+def _assignments(function_name: str, module: PythonModule) -> list[Assignment]:
+    for function in module.functions:
+        if function.name == function_name:
+            return list(function.assignments)
+    for klass in module.classes:
+        for method in klass.methods:
+            if method.name == function_name:
+                return list(method.assignments)
+    raise AssertionError(f"no function/method named {function_name!r}")
+
+
+def test_analyze_module_records_a_self_attribute_assignment_from_a_call(tmp_path: Path) -> None:
+    source = "class Service:\n    def __init__(self):\n        self.repo = Repo()\n"
+    module = _analyze(tmp_path, source)
+
+    (assignment,) = _assignments("__init__", module)
+    assert assignment == Assignment(
+        target="repo",
+        is_attribute=True,
+        value_kind=AssignedValueKind.CALL,
+        value_expression="Repo",
+        line=3,
+    )
+
+
+def test_analyze_module_records_a_self_attribute_assignment_from_a_bare_name(
+    tmp_path: Path,
+) -> None:
+    source = "class Service:\n    def __init__(self, repo):\n        self.repo = repo\n"
+    module = _analyze(tmp_path, source)
+
+    (assignment,) = _assignments("__init__", module)
+    assert assignment == Assignment(
+        target="repo",
+        is_attribute=True,
+        value_kind=AssignedValueKind.NAME,
+        value_expression="repo",
+        line=3,
+    )
+
+
+def test_analyze_module_records_a_local_variable_assignment_from_an_attribute(
+    tmp_path: Path,
+) -> None:
+    source = "def use(self):\n    x = self.repo\n"
+    module = _analyze(tmp_path, source)
+
+    (assignment,) = _assignments("use", module)
+    assert assignment == Assignment(
+        target="x",
+        is_attribute=False,
+        value_kind=AssignedValueKind.ATTRIBUTE,
+        value_expression="self.repo",
+        line=2,
+    )
+
+
+def test_analyze_module_ignores_assignments_with_no_usable_type_shape(tmp_path: Path) -> None:
+    """Tuple unpacking, subscript targets, and literal/binop values carry no type
+    information and are not recorded at all -- not recorded as unresolved, just absent."""
+    source = "def use():\n    a, b = 1, 2\n    d = {}\n    d['k'] = 1\n    n = 1 + 2\n"
+    module = _analyze(tmp_path, source)
+
+    assert _assignments("use", module) == []
+
+
+def test_analyze_module_still_captures_calls_nested_inside_an_assignment_value(
+    tmp_path: Path,
+) -> None:
+    """Recording an assignment fact must not stop the existing call-site capture for a
+    call nested inside the assignment's own value expression."""
+    source = "def use():\n    d = {}\n    d[compute_key()] = 1\n"
+    module = _analyze(tmp_path, source)
+
+    assert [c.expression for c in module.functions[0].calls] == ["compute_key"]
+
+
+def test_call_site_captures_positional_and_keyword_arguments(tmp_path: Path) -> None:
+    source = "def use():\n    handler(a, b, timeout=30)\n"
+    module = _analyze(tmp_path, source)
+
+    call_site = module.functions[0].calls[0]
+    assert call_site.arguments == [
+        CallArgument(value="a"),
+        CallArgument(value="b"),
+        CallArgument(value="30", keyword="timeout"),
+    ]
+
+
+def test_call_site_captures_star_and_double_star_arguments(tmp_path: Path) -> None:
+    source = "def use(args, kwargs):\n    handler(*args, **kwargs)\n"
+    module = _analyze(tmp_path, source)
+
+    call_site = module.functions[0].calls[0]
+    assert call_site.arguments == [CallArgument(value="*args"), CallArgument(value="**kwargs")]
+
+
+def test_analyze_module_captures_module_level_call_sites(tmp_path: Path) -> None:
+    """A call written directly at module scope (e.g. a route-registration call
+    statement, not inside any function) is captured, attributed to the module."""
+    source = "router.add_api_route('/health', health_check)\n"
+    module = _analyze(tmp_path, source)
+
+    assert [c.expression for c in module.calls] == ["router.add_api_route"]
+    assert module.calls[0].containing_symbol_id == "module"
+
+
+def test_analyze_module_level_calls_do_not_include_calls_made_inside_a_function(
+    tmp_path: Path,
+) -> None:
+    source = "setup()\n\ndef handler():\n    inner_call()\n"
+    module = _analyze(tmp_path, source)
+
+    assert [c.expression for c in module.calls] == ["setup"]
+    assert [c.expression for c in module.functions[0].calls] == ["inner_call"]

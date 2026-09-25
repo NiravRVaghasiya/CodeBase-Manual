@@ -59,7 +59,25 @@ verdict so a caller can tell "this result had something quarantined" from
 - `ai.qa.answer_question`: the model must list `cited_ids` for the
   candidates its answer actually relied on; unresolved citations are
   dropped from `Answer.evidence` and don't contribute to `Answer.confidence`.
+- `ai.impact.analyze_impact`: the free-prose `explanation` is grounded the
+  same way. Unlike `ask`/`change`, impact's candidates aren't a retrieval
+  result -- `build_impact_candidates` (`ai.impact`) calls `query.candidates.
+  build_candidate_set_from_refs` directly over the target/dependents/tests
+  that `compute_impact_facts` already computed, so the model can still only
+  cite by opaque ID, never a raw identifier. This closed what was previously
+  a real, explicitly-documented gap in this trust boundary: `explanation`
+  had no citation mechanism at all, so an unsupported claim in it couldn't
+  be detected the way a hallucinated `cited_ids` entry in `ask`/`change`
+  could (see `docs/performance.md`).
+  **Grounding is independent of confidence here**: `ImpactReport.confidence`
+  is still computed purely from `compute_impact_facts`'s dependency-graph
+  evidence via `confidence_for_impact_facts` (see `docs/confidence.md`) --
+  a rejected citation in `explanation` lowers `ImpactReport.grounding`
+  (and empties/trims `ImpactReport.evidence`), not `confidence`. The facts
+  (dependents, tests, APIs) were never at risk from a bad citation; only
+  the prose explaining them was.
 
 See `tests/unit/test_grounding.py`, `tests/unit/test_change_planner.py`,
-and `tests/unit/test_qa.py` for the hallucination-quarantine cases this
-covers (a valid ID, an invented ID, and a mix of both).
+`tests/unit/test_qa.py`, and `tests/unit/test_impact.py` for the
+hallucination-quarantine cases this covers (a valid ID, an invented ID, and
+a mix of both).

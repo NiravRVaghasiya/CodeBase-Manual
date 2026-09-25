@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from codebase_manual.domain.models import (
+    PYTHON_MODULE_SCHEMA_VERSION,
     EntityKind,
     EntityRef,
     FileHashStrategy,
@@ -31,6 +32,7 @@ from codebase_manual.domain.models import (
     RelationshipKind,
     ScanResult,
     SourceLocation,
+    UnresolvedCall,
 )
 from codebase_manual.persistence.orm import (
     AICacheORM,
@@ -39,6 +41,7 @@ from codebase_manual.persistence.orm import (
     RelationshipORM,
     RepositoryORM,
     SymbolORM,
+    UnresolvedCallORM,
     WorkingCopyORM,
 )
 from codebase_manual.persistence.snapshot import RepositorySnapshot
@@ -117,6 +120,7 @@ class IndexStore:
         scan_result: ScanResult,
         modules: list[PythonModule],
         relationships: list[Relationship],
+        unresolved_calls: Sequence[UnresolvedCall] = (),
     ) -> int:
         identity = repository_identity(scan_result)
         commit_sha = scan_result.repository.git.commit_sha
@@ -152,6 +156,7 @@ class IndexStore:
                         is_dirty=scan_result.repository.git.is_dirty,
                         remote_url=scan_result.repository.git.remote_url,
                         indexed_at=_to_naive_utc(scan_result.repository.indexed_at),
+                        analyzer_version=PYTHON_MODULE_SCHEMA_VERSION,
                     )
                     session.add(run)
                     session.flush()
@@ -162,6 +167,8 @@ class IndexStore:
                         session.add(row)
                     for relationship in relationships:
                         session.add(_relationship_row(run.id, relationship))
+                    for unresolved_call in unresolved_calls:
+                        session.add(_unresolved_call_row(run.id, unresolved_call))
 
                     session.commit()
                     return run.id
@@ -332,6 +339,16 @@ def _relationship_row(index_run_id: int, relationship: Relationship) -> Relation
     )
 
 
+def _unresolved_call_row(index_run_id: int, unresolved_call: UnresolvedCall) -> UnresolvedCallORM:
+    return UnresolvedCallORM(
+        index_run_id=index_run_id,
+        source_kind=unresolved_call.source.kind.value,
+        source_identifier=unresolved_call.source.identifier,
+        expression=unresolved_call.expression,
+        location=unresolved_call.location.model_dump_json(),
+    )
+
+
 def _load_snapshot(
     session: Session, repo_row: RepositoryORM, run: IndexRunORM
 ) -> RepositorySnapshot:
@@ -350,6 +367,11 @@ def _load_snapshot(
         .scalars()
         .all()
     )
+    unresolved_call_rows = (
+        session.execute(select(UnresolvedCallORM).where(UnresolvedCallORM.index_run_id == run.id))
+        .scalars()
+        .all()
+    )
 
     return RepositorySnapshot(
         repository_identity=repo_row.identity,
@@ -361,6 +383,8 @@ def _load_snapshot(
         files=[_file_record(row) for row in file_rows],
         modules=_reconstruct_modules(symbol_rows),
         relationships=[_relationship(row) for row in relationship_rows],
+        unresolved_calls=[_unresolved_call(row) for row in unresolved_call_rows],
+        analyzer_version=run.analyzer_version,
     )
 
 
@@ -388,4 +412,12 @@ def _relationship(row: RelationshipORM) -> Relationship:
         target=EntityRef(kind=EntityKind(row.target_kind), identifier=row.target_identifier),
         evidence=row.evidence,
         location=SourceLocation.model_validate_json(row.location) if row.location else None,
+    )
+
+
+def _unresolved_call(row: UnresolvedCallORM) -> UnresolvedCall:
+    return UnresolvedCall(
+        source=EntityRef(kind=EntityKind(row.source_kind), identifier=row.source_identifier),
+        expression=row.expression,
+        location=SourceLocation.model_validate_json(row.location),
     )

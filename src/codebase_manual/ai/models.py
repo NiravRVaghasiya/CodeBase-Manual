@@ -93,3 +93,5 @@ class ImpactReport(BaseModel):
     explanation: str
     confidence: Confidence
     truncated: bool = False
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    grounding: ValidationVerdict = ValidationVerdict.VALID

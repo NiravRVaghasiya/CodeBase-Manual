@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from codebase_manual.domain.models import FileHashStrategy, FileRecord
+from codebase_manual.domain.models import FileRecord, file_fingerprint_matches
 from codebase_manual.persistence.snapshot import RepositorySnapshot
 
 
@@ -32,25 +32,6 @@ class IndexDriftReport(BaseModel):
         return bool(self.added_files or self.removed_files or self.changed_files)
 
 
-def _is_unchanged(previous: FileRecord, current: FileRecord) -> bool:
-    if (
-        previous.hash_strategy is FileHashStrategy.FULL_HASH
-        and current.hash_strategy is FileHashStrategy.FULL_HASH
-        and previous.content_hash is not None
-        and current.content_hash is not None
-    ):
-        return previous.content_hash == current.content_hash
-
-    # At least one side has no full content hash -- fall back to metadata
-    # rather than treating the file as unconditionally changed.
-    return (
-        previous.mtime is not None
-        and current.mtime is not None
-        and previous.size_bytes == current.size_bytes
-        and previous.mtime == current.mtime
-    )
-
-
 def detect_index_drift(
     previous: RepositorySnapshot, current_files: list[FileRecord]
 ) -> IndexDriftReport:
@@ -63,7 +44,7 @@ def detect_index_drift(
     changed: list[str] = []
     unchanged = 0
     for path in sorted(set(current_by_path) & set(previous_by_path)):
-        if _is_unchanged(previous_by_path[path], current_by_path[path]):
+        if file_fingerprint_matches(previous_by_path[path], current_by_path[path]):
             unchanged += 1
         else:
             changed.append(path)
