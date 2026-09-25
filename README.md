@@ -520,5 +520,4 @@ parity with Python, and hybrid retrieval's semantic-similarity interface.
 
 ## License
 
-No license file is present in this repository. Treat it as unlicensed
-(all rights reserved by default) until a `LICENSE` file is added.
+[MIT](LICENSE).

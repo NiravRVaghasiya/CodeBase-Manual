@@ -3,6 +3,8 @@ name = "codebase-manual"
 version = "0.1.0"
 description = "A living manual for software repositories: deterministic code analysis plus AI-driven understanding and change planning."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "typer>=0.12",
